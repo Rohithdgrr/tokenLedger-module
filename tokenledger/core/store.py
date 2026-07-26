@@ -3,6 +3,7 @@ In-memory storage engine with ring buffer, retention policies,
 immutable event logs, and optional JSONL file persistence.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -219,3 +220,16 @@ class MemoryStore:
     def get_record_count(self) -> int:
         with self.lock:
             return len(self.records)
+
+    async def async_insert_record(self, record: Dict[str, Any]) -> None:
+        """Async wrapper for insert_record — runs in executor to avoid blocking."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.insert_record, record)
+
+    async def async_get_records(self) -> List[Dict[str, Any]]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.get_records)
+
+    async def async_compact(self) -> Dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.compact)

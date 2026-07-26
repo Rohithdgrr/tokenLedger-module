@@ -126,6 +126,7 @@ class InterceptionLayer:
         self.rate_limit_rps = rate_limit_rps
         self.on_budget_exceeded = on_budget_exceeded
         self.on_record = on_record
+        self.on_budget_threshold: Optional[Callable] = None
         self._original_methods: Dict[int, Dict[str, Callable]] = {}
         self._circuit_state: Dict[str, Dict] = {}
         self._rate_buckets: Dict[str, TokenBucket] = {}
