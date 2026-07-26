@@ -203,3 +203,19 @@ class MemoryStore:
             if expected != actual:
                 tampered.append(r.get("record_id", "unknown"))
         return tampered
+
+    def compact(self) -> Dict[str, Any]:
+        """Force retention pruning + rebuild aggregates. Returns removal stats."""
+        with self.lock:
+            before = len(self.records)
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=self.retention.max_age_days)).isoformat()
+            pruned = [r for r in self.records if r.get("timestamp", "") > cutoff]
+            self.records = deque(pruned, maxlen=self.retention.max_records)
+            self.running_totals.clear()
+            for r in self.records:
+                self._update_running_totals(r)
+            return {"removed": before - len(self.records), "remaining": len(self.records)}
+
+    def get_record_count(self) -> int:
+        with self.lock:
+            return len(self.records)

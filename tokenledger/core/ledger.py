@@ -184,6 +184,8 @@ class TokenLedger:
 
         verified = self.verifier.verify(record)
         self.store.insert_record(verified)
+        if self.interceptor.on_record:
+            self.interceptor.on_record(verified)
         return verified
 
     def get_records(self) -> List[Dict[str, Any]]:

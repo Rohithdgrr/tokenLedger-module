@@ -490,5 +490,119 @@ class TestTokenBucket:
         assert b.tokens < 1000
 
 
+class TestInterceptionCallbacks:
+    def test_on_budget_exceeded_called(self):
+        from tokenledger import TokenLedger
+        ledger = TokenLedger()
+        ledger.set_budget("user", "alice", limit_usd=0.0)
+        cb_called = []
+        ledger.interceptor.on_budget_exceeded = lambda e: cb_called.append(e)
+        with pytest.raises(BudgetExceededError):
+            ledger.interceptor._budget_check(
+                {"user_id": "alice", "project_id": "default", "model": "gpt-4"},
+                "openai", {"messages": [], "model": "gpt-4"},
+            )
+        assert len(cb_called) == 1
+
+    def test_on_record_called(self):
+        from tokenledger import TokenLedger
+        ledger = TokenLedger()
+        records = []
+        ledger.interceptor.on_record = records.append
+        ledger.record_usage(provider="test", model="t1", input_tokens=10, output_tokens=5)
+        assert len(records) == 1
+        assert records[0]["model"] == "t1"
+
+
+class TestGetHealth:
+    def test_get_health_returns_status(self):
+        from tokenledger import TokenLedger
+        ledger = TokenLedger()
+        health = ledger.interceptor.get_health()
+        assert isinstance(health, dict)
+
+
+class TestPerProviderConfig:
+    def test_configure_provider(self):
+        from tokenledger import TokenLedger
+        ledger = TokenLedger()
+        ledger.interceptor.configure_provider("openai", max_retries=5, rate_limit_rps=50)
+        cfg = ledger.interceptor._get_provider_config("openai")
+        assert cfg["max_retries"] == 5
+        assert cfg["rate_limit_rps"] == 50
+
+    def test_provider_config_fallback(self):
+        from tokenledger import TokenLedger
+        ledger = TokenLedger()
+        cfg = ledger.interceptor._get_provider_config("nonexistent")
+        assert cfg == {}
+
+
+class TestStreamWrapper:
+    def test_sync_stream_iteration(self):
+        from tokenledger.core.interceptor import StreamWrapper
+
+        class FakeChunk:
+            usage = type("Usage", (), {"prompt_tokens": 5, "completion_tokens": 3})()
+
+        stream = [FakeChunk()]
+        wrapper = StreamWrapper(iter(stream), "openai")
+        consumed = list(wrapper)
+        assert len(consumed) == 1
+        usage = wrapper.get_accumulated_usage()
+        assert usage["input_tokens"] == 5
+        assert usage["output_tokens"] == 3
+        assert usage["source"] == "api_reported"
+
+
+class TestCompact:
+    def test_compact_removes_old_records(self):
+        from tokenledger import TokenLedger
+        from datetime import datetime, timezone, timedelta
+        ledger = TokenLedger()
+        ledger.record_usage(provider="test", model="t1", input_tokens=1, output_tokens=1)
+        # make record look old, then shrink retention
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        ledger.store.records[-1]["timestamp"] = old_ts
+        ledger.store.retention.max_age_days = 0
+        result = ledger.store.compact()
+        assert result["removed"] == 1
+        assert result["remaining"] == 0
+
+    def test_compact_keeps_recent_records(self):
+        from tokenledger import TokenLedger
+        ledger = TokenLedger()
+        ledger.store.retention.max_age_days = 365
+        ledger.record_usage(provider="test", model="t1", input_tokens=1, output_tokens=1)
+        result = ledger.store.compact()
+        assert result["removed"] == 0
+        assert result["remaining"] == 1
+
+    def test_get_record_count(self):
+        from tokenledger import TokenLedger
+        ledger = TokenLedger()
+        assert ledger.store.get_record_count() == 0
+        ledger.record_usage(provider="test", model="t1", input_tokens=1, output_tokens=1)
+        assert ledger.store.get_record_count() == 1
+
+
+class TestBudgetImprovements:
+    def test_budget_accepts_max_tokens(self):
+        from tokenledger import TokenLedger
+        ledger = TokenLedger()
+        ledger.set_budget("user", "alice", limit_usd=1.0)
+        enforcer = ledger.interceptor.enforcer
+        result = enforcer.check_budget(
+            user_id="alice", project_id="default", provider="openai", model="gpt-4", max_tokens=50,
+        )
+        assert result is True
+
+    def test_update_model_stats(self):
+        from tokenledger import TokenLedger
+        ledger = TokenLedger()
+        ledger.interceptor.enforcer.update_model_stats("gpt-4", 100, 60)
+        assert ledger.interceptor.enforcer._avg_output_per_model["gpt-4"] != 0.5
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -4,8 +4,9 @@ import asyncio
 import logging
 import time
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .budget import BudgetEnforcer, BudgetExceededError
 from .estimator import TokenEstimator
@@ -16,7 +17,7 @@ from .verifier import VerificationEngine
 
 logger = logging.getLogger(__name__)
 
-TRACKING_KWARGS = {"user_id", "project_id", "conversation_id", "agent_id"}
+TRACKING_KWARGS = {"user_id", "project_id", "conversation_id", "agent_id", "prompt_hash"}
 
 
 class CircuitBreakerOpenError(Exception):
@@ -24,7 +25,7 @@ class CircuitBreakerOpenError(Exception):
 
 
 class TokenBucket:
-    """Simple token bucket rate limiter."""
+    """Token bucket rate limiter."""
 
     def __init__(self, rate: float):
         self.rate = rate
@@ -43,6 +44,48 @@ class TokenBucket:
             self.last = time.monotonic()
         else:
             self.tokens -= 1
+
+    @property
+    def available(self) -> float:
+        now = time.monotonic()
+        elapsed = now - self.last
+        return min(self.rate, self.tokens + elapsed * self.rate)
+
+
+class StreamWrapper:
+    """Wraps a streaming response to accumulate usage metadata."""
+
+    def __init__(self, stream, provider: str):
+        self._stream = stream
+        self._provider = provider
+        self._chunks: List[Any] = []
+
+    def __iter__(self):
+        for chunk in self._stream:
+            self._chunks.append(chunk)
+            yield chunk
+
+    def __aiter__(self):
+        return self._aiter()
+
+    async def _aiter(self):
+        async for chunk in self._stream:
+            self._chunks.append(chunk)
+            yield chunk
+
+    def get_accumulated_usage(self) -> Optional[Dict[str, Any]]:
+        for chunk in reversed(self._chunks):
+            usage = getattr(chunk, "usage", None)
+            if usage:
+                input_tokens = getattr(usage, "prompt_tokens", getattr(usage, "input_tokens", 0))
+                output_tokens = getattr(usage, "completion_tokens", getattr(usage, "output_tokens", 0))
+                return {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": input_tokens + output_tokens,
+                    "source": "api_reported",
+                }
+        return None
 
 
 class InterceptionLayer:
@@ -64,6 +107,8 @@ class InterceptionLayer:
         circuit_breaker_threshold: int = 5,
         circuit_recovery_timeout: float = 30.0,
         rate_limit_rps: int = 100,
+        on_budget_exceeded: Optional[Callable] = None,
+        on_record: Optional[Callable] = None,
     ):
         self.ledger = ledger
         self.store = store
@@ -79,9 +124,19 @@ class InterceptionLayer:
         self.circuit_breaker_threshold = circuit_breaker_threshold
         self.circuit_recovery_timeout = circuit_recovery_timeout
         self.rate_limit_rps = rate_limit_rps
+        self.on_budget_exceeded = on_budget_exceeded
+        self.on_record = on_record
         self._original_methods: Dict[int, Dict[str, Callable]] = {}
         self._circuit_state: Dict[str, Dict] = {}
         self._rate_buckets: Dict[str, TokenBucket] = {}
+        self._provider_config: Dict[str, Dict[str, Any]] = {}
+
+    def configure_provider(self, provider: str, **kwargs) -> None:
+        """Per-provider override for retries, timeout, rate limit, etc."""
+        self._provider_config.setdefault(provider, {}).update(kwargs)
+
+    def _get_provider_config(self, provider: str) -> Dict[str, Any]:
+        return self._provider_config.get(provider, {})
 
     def _strip_tracking_kwargs(self, kwargs: Dict[str, Any]) -> None:
         for key in TRACKING_KWARGS:
@@ -121,11 +176,9 @@ class InterceptionLayer:
 
     def wrap_gemini(self, client: Any) -> Any:
         try:
-            from google.genai import types
-            original = client.models.generate_content
             return self._wrap_attr(client, "models.generate_content", "google")
-        except ImportError:
-            logger.warning("google-genai not installed; wrap_gemini requires `pip install google-generativeai`")
+        except AttributeError:
+            logger.warning("wrap_gemini: client has no 'models.generate_content'; use record_usage() manually")
             return client
 
     def wrap_ollama(self, client: Any) -> Any:
@@ -141,6 +194,26 @@ class InterceptionLayer:
                 parent = getattr(parent, part)
             setattr(parent, parts[-1], original)
         return client
+
+    def get_health(self) -> Dict[str, Any]:
+        """Return circuit breaker and rate limiter status per provider."""
+        now = time.monotonic()
+        result = {}
+        all_providers = set(self._circuit_state.keys()) | set(self._rate_buckets.keys())
+        for provider in sorted(all_providers):
+            cb = self._circuit_state.get(provider, {"state": "closed", "failures": 0, "since": 0.0})
+            bucket = self._rate_buckets.get(provider)
+            entry: Dict[str, Any] = {
+                "circuit_state": cb["state"],
+                "circuit_failures": cb["failures"],
+            }
+            if cb["state"] == "open":
+                remaining = self.circuit_recovery_timeout - (now - cb["since"])
+                entry["circuit_recovery_seconds"] = round(max(remaining, 0), 1)
+            if bucket:
+                entry["rate_limit_available_tokens"] = round(bucket.available, 1)
+            result[provider] = entry
+        return result
 
     def _check_circuit(self, provider: str) -> None:
         state = self._circuit_state.get(provider)
@@ -166,21 +239,28 @@ class InterceptionLayer:
     def _check_rate_limit(self, provider: str) -> None:
         bucket = self._rate_buckets.get(provider)
         if bucket is None:
-            bucket = TokenBucket(self.rate_limit_rps)
+            cfg = self._get_provider_config(provider)
+            rps = cfg.get("rate_limit_rps", self.rate_limit_rps)
+            bucket = TokenBucket(rps)
             self._rate_buckets[provider] = bucket
         bucket.consume()
 
     def _call_with_retry(self, original: Callable, args: tuple, kwargs: Dict[str, Any], provider: str, timeout: Optional[float] = None) -> Any:
         self._strip_tracking_kwargs(kwargs)
-        delay = self.retry_delay
-        for attempt in range(self.max_retries + 1):
+        cfg = self._get_provider_config(provider)
+        max_retries = cfg.get("max_retries", self.max_retries)
+        retry_delay = cfg.get("retry_delay", self.retry_delay)
+        req_timeout = cfg.get("request_timeout", timeout)
+
+        delay = retry_delay
+        for attempt in range(max_retries + 1):
             try:
-                if timeout and attempt == 0:
-                    kwargs = {**kwargs, "timeout": timeout}
+                if req_timeout and attempt == 0:
+                    kwargs = {**kwargs, "timeout": req_timeout}
                 return original(*args, **kwargs)
             except (ConnectionError, TimeoutError, CircuitBreakerOpenError):
-                if attempt < self.max_retries:
-                    logger.warning("Retry %d/%d for %s after transient error", attempt + 1, self.max_retries, provider)
+                if attempt < max_retries:
+                    logger.warning("Retry %d/%d for %s", attempt + 1, max_retries, provider)
                     time.sleep(delay)
                     delay *= 2
                 else:
@@ -190,17 +270,22 @@ class InterceptionLayer:
 
     async def _call_with_retry_async(self, original: Callable, args: tuple, kwargs: Dict[str, Any], provider: str, timeout: Optional[float] = None) -> Any:
         self._strip_tracking_kwargs(kwargs)
-        delay = self.retry_delay
-        for attempt in range(self.max_retries + 1):
+        cfg = self._get_provider_config(provider)
+        max_retries = cfg.get("max_retries", self.max_retries)
+        retry_delay = cfg.get("retry_delay", self.retry_delay)
+        req_timeout = cfg.get("request_timeout", timeout)
+
+        delay = retry_delay
+        for attempt in range(max_retries + 1):
             try:
-                if timeout and attempt == 0:
-                    kwargs = {**kwargs, "timeout": timeout}
-                if timeout:
-                    return await asyncio.wait_for(original(*args, **kwargs), timeout=timeout)
+                if req_timeout and attempt == 0:
+                    kwargs = {**kwargs, "timeout": req_timeout}
+                if req_timeout:
+                    return await asyncio.wait_for(original(*args, **kwargs), timeout=req_timeout)
                 return await original(*args, **kwargs)
             except (ConnectionError, TimeoutError, asyncio.TimeoutError, CircuitBreakerOpenError):
-                if attempt < self.max_retries:
-                    logger.warning("Async retry %d/%d for %s", attempt + 1, self.max_retries, provider)
+                if attempt < max_retries:
+                    logger.warning("Async retry %d/%d for %s", attempt + 1, max_retries, provider)
                     await asyncio.sleep(delay)
                     delay *= 2
                 else:
@@ -215,19 +300,23 @@ class InterceptionLayer:
             "model": kwargs.get("model", "unknown"),
             "conversation_id": kwargs.get("conversation_id"),
             "agent_id": kwargs.get("agent_id"),
+            "prompt_hash": kwargs.get("prompt_hash"),
         }
 
-    def _budget_check(self, metadata: Dict[str, Any], provider: str, messages: list) -> None:
+    def _budget_check(self, metadata: Dict[str, Any], provider: str, kwargs: Dict[str, Any]) -> None:
         try:
             self.enforcer.check_budget(
                 user_id=metadata["user_id"],
                 project_id=metadata["project_id"],
                 provider=provider,
                 model=metadata["model"],
-                messages=messages,
+                messages=kwargs.get("messages", []),
+                max_tokens=kwargs.get("max_tokens"),
             )
-        except BudgetExceededError:
+        except BudgetExceededError as e:
             self._log_blocked_attempt(metadata, provider)
+            if self.on_budget_exceeded:
+                self.on_budget_exceeded(e)
             raise
 
     def _record(self, provider: str, metadata: Dict[str, Any], messages: list, response: Any, latency_ms: float) -> None:
@@ -258,6 +347,8 @@ class InterceptionLayer:
             record["conversation_id"] = metadata["conversation_id"]
         if metadata.get("agent_id"):
             record["agent_id"] = metadata["agent_id"]
+        if metadata.get("prompt_hash"):
+            record["prompt_hash"] = metadata["prompt_hash"]
         if not self.pricing.has_model(provider, metadata["model"]):
             if self.unknown_model_policy == "block":
                 raise UnknownModelError(f"Unknown model: {provider}:{metadata['model']}")
@@ -268,10 +359,61 @@ class InterceptionLayer:
             record["system"] = sysmon.snapshot()
         record = self.verifier.verify(record, response)
         self.store.insert_record(record)
+        self.enforcer.update_model_stats(metadata["model"], token_data["input_tokens"], token_data["output_tokens"])
+        if self.on_record:
+            self.on_record(record)
+
+    def _handle_stream(self, response: Any, provider: str, metadata: Dict[str, Any]) -> Any:
+        wrapped = StreamWrapper(response, provider)
+        original_iter = wrapped.__iter__
+        original_aiter = wrapped.__aiter__
+
+        def tracked_iter():
+            yield from original_iter()
+            usage = wrapped.get_accumulated_usage()
+            if usage:
+                self._record_usage_from_stream(provider, metadata, usage)
+
+        async def tracked_aiter():
+            async for chunk in original_aiter():
+                yield chunk
+            usage = wrapped.get_accumulated_usage()
+            if usage:
+                self._record_usage_from_stream(provider, metadata, usage)
+
+        wrapped.__iter__ = tracked_iter
+        wrapped.__aiter__ = tracked_aiter
+        return wrapped
+
+    def _record_usage_from_stream(self, provider: str, metadata: Dict[str, Any], token_data: Dict[str, Any]) -> None:
+        cost = self.pricing.calculate_cost(provider, metadata["model"], token_data["input_tokens"], token_data["output_tokens"])
+        record = {
+            "record_id": str(uuid.uuid4()),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "provider": provider,
+            "model": metadata["model"],
+            "input_tokens": token_data["input_tokens"],
+            "output_tokens": token_data["output_tokens"],
+            "total_tokens": token_data.get("total_tokens", token_data["input_tokens"] + token_data["output_tokens"]),
+            "cost_usd": cost,
+            "latency_ms": 0.0,
+            "user_id": metadata["user_id"],
+            "project_id": metadata["project_id"],
+            "status": "success",
+            "source": "stream",
+        }
+        if metadata.get("conversation_id"):
+            record["conversation_id"] = metadata["conversation_id"]
+        if metadata.get("agent_id"):
+            record["agent_id"] = metadata["agent_id"]
+        if metadata.get("prompt_hash"):
+            record["prompt_hash"] = metadata["prompt_hash"]
+        self.store.insert_record(record)
+        self.enforcer.update_model_stats(metadata["model"], token_data["input_tokens"], token_data["output_tokens"])
 
     def _track_request(self, original: Callable, provider: str, args: tuple, kwargs: Dict[str, Any]) -> Any:
         metadata = self._extract_meta(kwargs)
-        self._budget_check(metadata, provider, kwargs.get("messages", []))
+        self._budget_check(metadata, provider, kwargs)
         self._check_circuit(provider)
         self._check_rate_limit(provider)
         start_time = time.monotonic()
@@ -283,12 +425,16 @@ class InterceptionLayer:
         finally:
             latency_ms = (time.monotonic() - start_time) * 1000
         self._record_result(provider, True)
+
+        if kwargs.get("stream"):
+            return self._handle_stream(response, provider, metadata)
+
         self._record(provider, metadata, kwargs.get("messages", []), response, latency_ms)
         return response
 
     async def _track_request_async(self, original: Callable, provider: str, args: tuple, kwargs: Dict[str, Any]) -> Any:
         metadata = self._extract_meta(kwargs)
-        self._budget_check(metadata, provider, kwargs.get("messages", []))
+        self._budget_check(metadata, provider, kwargs)
         self._check_circuit(provider)
         self._check_rate_limit(provider)
         start_time = time.monotonic()
@@ -300,6 +446,10 @@ class InterceptionLayer:
         finally:
             latency_ms = (time.monotonic() - start_time) * 1000
         self._record_result(provider, True)
+
+        if kwargs.get("stream"):
+            return self._handle_stream(response, provider, metadata)
+
         self._record(provider, metadata, kwargs.get("messages", []), response, latency_ms)
         return response
 
