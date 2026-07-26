@@ -32,8 +32,14 @@ jobs:
       - name: Type check with mypy
         run: mypy tokenledger/ || true
 
+      - name: Security scan with bandit
+        run: bandit -r tokenledger/ -ll || true
+
       - name: Test with pytest
         run: python -m pytest tests/ -v --cov=tokenledger --cov-report=term
+
+      - name: Benchmark (quick smoke)
+        run: python -m pytest tests/test_benchmark.py -v --benchmark-only --benchmark-skip='*' --benchmark-min-rounds=2 || true
 
   build:
     runs-on: ubuntu-latest

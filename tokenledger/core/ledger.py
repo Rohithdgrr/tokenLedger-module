@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -21,8 +23,19 @@ from ..utils.export import ExportEngine
 class TokenLedger:
     """Lightweight governance layer for LLM usage tracking."""
 
-    def __init__(self, persist_path: Optional[str] = None, unknown_model_policy: str = "estimate", system_monitor: Optional[SystemMonitor] = None):
-        self.store = MemoryStore(persist_path=persist_path)
+    def __init__(
+        self,
+        persist_path: Optional[str] = None,
+        unknown_model_policy: str = "estimate",
+        system_monitor: Optional[SystemMonitor] = None,
+        max_records: int = 100_000,
+        retention_days: int = 90,
+    ):
+        self.store = MemoryStore(
+            persist_path=persist_path,
+            max_records=max_records,
+            retention_days=retention_days,
+        )
         self.pricing = PricingRegistry()
         self.extractor = TokenExtractor()
         self.estimator = TokenEstimator()
@@ -98,6 +111,16 @@ class TokenLedger:
         latency_ms: Optional[float] = None,
         source: str = "manual",
         system_context: bool = False,
+        conversation_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        prompt_hash: Optional[str] = None,
+        reasoning_tokens: int = 0,
+        cached_input_tokens: int = 0,
+        embedding_tokens: int = 0,
+        tool_calls: Optional[List[Dict[str, Any]]] = None,
+        media_type: Optional[str] = None,
+        cache_hit: bool = False,
+        status: str = "success",
     ) -> Dict[str, Any]:
         """Record a completed usage event."""
         if input_tokens < 0 or output_tokens < 0:
@@ -108,7 +131,7 @@ class TokenLedger:
         total_tokens = input_tokens + output_tokens
         cost_usd = self.pricing.calculate_cost(provider, model, input_tokens, output_tokens)
 
-        record = {
+        record: Dict[str, Any] = {
             "record_id": str(uuid.uuid4()),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "provider": provider,
@@ -120,9 +143,32 @@ class TokenLedger:
             "latency_ms": latency_ms if latency_ms is not None else 0,
             "user_id": user_id,
             "project_id": project_id,
-            "status": "success",
+            "status": status,
             "source": source,
         }
+
+        if conversation_id:
+            record["conversation_id"] = conversation_id
+        if agent_id:
+            record["agent_id"] = agent_id
+        if prompt_hash:
+            record["prompt_hash"] = prompt_hash
+        else:
+            record["prompt_hash"] = ""
+        if reasoning_tokens:
+            record["reasoning_tokens"] = reasoning_tokens
+        if cached_input_tokens:
+            record["cached_input_tokens"] = cached_input_tokens
+        if embedding_tokens:
+            record["embedding_tokens"] = embedding_tokens
+            record["embedding"] = True
+        if tool_calls:
+            record["tool_calls"] = tool_calls
+            record["tool_call_count"] = len(tool_calls)
+        if media_type:
+            record["media_type"] = media_type
+        if cache_hit:
+            record["cache_hit"] = True
 
         self.budget_enforcer.check_budget(
             user_id=user_id,
@@ -187,3 +233,28 @@ class TokenLedger:
 
     def get_pricing(self, provider: str, model: str) -> Dict[str, Any]:
         return self.pricing.get_pricing(provider, model)
+
+    def apply_retention(self, max_age_days: Optional[int] = None) -> None:
+        """Manually trigger age-based retention."""
+        if max_age_days is not None:
+            self.store.retention.max_age_days = max_age_days
+        self.store._apply_retention()
+
+    def verify_immutability(self) -> List[str]:
+        """Return list of tampered record_ids, empty if all clean."""
+        return self.store.verify_immutability()
+
+    def get_efficiency(self, scope: str = "global", scope_id: str = "all") -> Dict[str, Any]:
+        return self.analytics.get_efficiency_stats(scope, scope_id)
+
+    @staticmethod
+    def fingerprint_prompt(messages: List[Dict[str, Any]]) -> str:
+        """Deterministic prompt fingerprint ignoring minor whitespace."""
+        raw = json.dumps(messages, sort_keys=True, default=str).strip()
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    def get_spending_by_conversation(self) -> List[Dict[str, Any]]:
+        return self.analytics.get_spending_by_dimension("conversation")
+
+    def get_spending_by_agent(self) -> List[Dict[str, Any]]:
+        return self.analytics.get_spending_by_dimension("agent")

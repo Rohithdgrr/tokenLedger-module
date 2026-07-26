@@ -1,36 +1,66 @@
 """
-In-memory storage engine with optional JSONL file persistence.
-No database required.
+In-memory storage engine with ring buffer, retention policies,
+immutable event logs, and optional JSONL file persistence.
 """
 
+import hashlib
 import json
 import os
 import threading
+from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional
+
+
+class RetentionPolicy:
+    """Data retention configuration."""
+
+    def __init__(
+        self,
+        max_age_days: int = 90,
+        max_records: int = 100_000,
+        archive_on_trim: bool = True,
+    ):
+        self.max_age_days = max_age_days
+        self.max_records = max_records
+        self.archive_on_trim = archive_on_trim
 
 
 class MemoryStore:
-    """
-    Primary data container for TokenLedger.
-    All state is held in Python native data structures.
-    """
+    """Thread-safe in-memory store with ring buffer and retention."""
 
-    def __init__(self, persist_path: Optional[str] = None):
-        self.records: List[Dict[str, Any]] = []
+    def __init__(
+        self,
+        persist_path: Optional[str] = None,
+        max_records: int = 100_000,
+        retention_days: int = 90,
+    ):
+        self.records: Deque[Dict[str, Any]] = deque(maxlen=max_records)
         self.budgets: Dict[str, Dict[str, Any]] = {}
         self.running_totals: Dict[str, Dict[str, Any]] = {}
         self.lock = threading.RLock()
         self.persist_path = persist_path
+        self.retention = RetentionPolicy(
+            max_age_days=retention_days,
+            max_records=max_records,
+            archive_on_trim=True,
+        )
 
         if persist_path and os.path.exists(persist_path):
             self._load_from_disk()
 
+    def _checksum(self, record: Dict[str, Any]) -> str:
+        """SHA-256 checksum of the record for immutability."""
+        raw = json.dumps(record, sort_keys=True, default=str).encode()
+        return hashlib.sha256(raw).hexdigest()
+
     def insert_record(self, record: Dict[str, Any]) -> None:
         """Thread-safe record insertion with aggregate updates."""
         with self.lock:
+            record["_checksum"] = self._checksum(record)
             self.records.append(record)
             self._update_running_totals(record)
+            self._apply_retention()
 
             if self.persist_path:
                 self._append_to_disk(record)
@@ -45,6 +75,10 @@ class MemoryStore:
             ("project", record.get("project_id", "default")),
             ("month", record.get("timestamp", "")[:7]),
         ]
+        if record.get("conversation_id"):
+            dimensions.append(("conversation", record["conversation_id"]))
+        if record.get("agent_id"):
+            dimensions.append(("agent", record["agent_id"]))
 
         for scope, scope_id in dimensions:
             key = f"{scope}:{scope_id}"
@@ -56,7 +90,6 @@ class MemoryStore:
                     "total_tokens": 0,
                     "cost_usd": 0.0,
                 }
-
             agg = self.running_totals[key]
             agg["requests"] += 1
             agg["input_tokens"] += record.get("input_tokens", 0)
@@ -65,28 +98,42 @@ class MemoryStore:
             agg["cost_usd"] += record.get("cost_usd", 0.0)
 
     def _append_to_disk(self, record: Dict[str, Any]) -> None:
-        """Append-only write to JSONL file."""
+        """Append-only write with checksum for immutability."""
         try:
+            line = json.dumps(record, default=str)
+            checksum = hashlib.sha256(line.encode()).hexdigest()
             with open(self.persist_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, default=str) + "\n")
+                f.write(f"{checksum}:{line}\n")
                 f.flush()
                 os.fsync(f.fileno())
         except (IOError, OSError) as e:
             print(f"Warning: Failed to persist record: {e}")
 
     def _load_from_disk(self) -> None:
-        """Load records from JSONL on startup."""
+        """Load and verify records from disk."""
         try:
             with open(self.persist_path, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
-                    if line:
-                        try:
+                    if not line:
+                        continue
+                    try:
+                        if ":" in line:
+                            stored_checksum, raw = line.split(":", 1)
+                            # Backward compat: old JSONL without checksum
+                            if len(stored_checksum) == 64:
+                                actual = hashlib.sha256(raw.encode()).hexdigest()
+                                if stored_checksum != actual:
+                                    continue
+                                record = json.loads(raw)
+                            else:
+                                record = json.loads(line)
+                        else:
                             record = json.loads(line)
-                            self.records.append(record)
-                            self._update_running_totals(record)
-                        except json.JSONDecodeError:
-                            continue
+                        self.records.append(record)
+                        self._update_running_totals(record)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
         except (IOError, OSError):
             pass
 
@@ -113,57 +160,43 @@ class MemoryStore:
             )
 
     def set_budget(self, scope: str, scope_id: str, budget_config: Dict[str, Any]) -> None:
-        """Store a budget rule."""
         with self.lock:
             self.budgets[f"{scope}:{scope_id}"] = budget_config
 
     def get_budget(self, scope: str, scope_id: str) -> Optional[Dict[str, Any]]:
-        """Retrieve a budget rule."""
         with self.lock:
             return self.budgets.get(f"{scope}:{scope_id}")
 
     def get_all_budgets(self) -> Dict[str, Dict[str, Any]]:
-        """Return all budget rules."""
         with self.lock:
             return dict(self.budgets)
 
     def clear(self) -> None:
-        """Clear all in-memory data."""
         with self.lock:
             self.records.clear()
             self.running_totals.clear()
             self.budgets.clear()
 
-    def rotate_if_needed(self, max_records: int = 100000) -> None:
-        """Archive old records when memory limit is reached."""
-        with self.lock:
-            if len(self.records) > max_records:
-                cutoff = len(self.records) - max_records
-                archived = self.records[:cutoff]
-                self.records = self.records[cutoff:]
-
-                archive_path = (
-                    self.persist_path.replace(".jsonl", "_archive.jsonl")
-                    if self.persist_path
-                    else "archive.jsonl"
-                )
-                try:
-                    with open(archive_path, "a", encoding="utf-8") as f:
-                        for record in archived:
-                            f.write(json.dumps(record, default=str) + "\n")
-                except (IOError, OSError):
-                    pass
-
-                self.running_totals.clear()
-                for record in self.records:
-                    self._update_running_totals(record)
-
-    def apply_retention(self, max_age_days: int = 90) -> None:
-        """Remove records older than max_age_days."""
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
-
-        with self.lock:
-            self.records = [r for r in self.records if r.get("timestamp", "") >= cutoff]
+    def _apply_retention(self) -> None:
+        """Apply age-based retention after each insert."""
+        if self.retention.max_age_days < 0:
+            return
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=self.retention.max_age_days)).isoformat()
+        pruned = [r for r in self.records if r.get("timestamp", "") > cutoff]
+        if len(pruned) < len(self.records):
+            self.records = deque(pruned, maxlen=self.retention.max_records)
             self.running_totals.clear()
-            for record in self.records:
-                self._update_running_totals(record)
+            for r in self.records:
+                self._update_running_totals(r)
+
+    def verify_immutability(self) -> List[str]:
+        """Check all records for tampering. Returns list of tampered record_ids."""
+        tampered = []
+        for r in self.get_records():
+            expected = r.get("_checksum", "")
+            if not expected:
+                continue
+            actual = self._checksum({k: v for k, v in r.items() if k != "_checksum"})
+            if expected != actual:
+                tampered.append(r.get("record_id", "unknown"))
+        return tampered

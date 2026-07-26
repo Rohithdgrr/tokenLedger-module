@@ -288,5 +288,130 @@ class TestEdgeCases:
         assert trend == []
 
 
+
+class TestAIFeatures:
+    def test_conversation_tracking(self):
+        l = TokenLedger()
+        cid = "conv-123"
+        l.record_usage("openai", "gpt-4o", 100, 50, conversation_id=cid)
+        l.record_usage("openai", "gpt-4o", 200, 100, conversation_id=cid)
+        records = l.get_records()
+        assert all(r["conversation_id"] == cid for r in records)
+        by_conv = l.get_spending_by_conversation()
+        assert len(by_conv) == 1
+
+    def test_agent_tracking(self):
+        l = TokenLedger()
+        l.record_usage("openai", "gpt-4o", 100, 50, agent_id="agent-a")
+        l.record_usage("openai", "gpt-4o", 200, 100, agent_id="agent-b")
+        by_agent = l.get_spending_by_agent()
+        assert len(by_agent) == 2
+
+    def test_fingerprint_prompt(self):
+        messages = [{"role": "user", "content": "hello"}]
+        fp1 = TokenLedger.fingerprint_prompt(messages)
+        fp2 = TokenLedger.fingerprint_prompt(messages)
+        assert fp1 == fp2
+        fp3 = TokenLedger.fingerprint_prompt([{"role": "user", "content": "world"}])
+        assert fp1 != fp3
+
+    def test_reasoning_tokens(self):
+        l = TokenLedger()
+        r = l.record_usage("openai", "o1", 100, 50, reasoning_tokens=30)
+        assert r["reasoning_tokens"] == 30
+        assert r["total_tokens"] == 150  # total = input+output, reasoning separate
+
+    def test_cache_hit(self):
+        l = TokenLedger()
+        r = l.record_usage("openai", "gpt-4o", 100, 50, cache_hit=True, cached_input_tokens=80)
+        assert r["cache_hit"] is True
+        assert r["cached_input_tokens"] == 80
+
+    def test_embedding_tracking(self):
+        l = TokenLedger()
+        r = l.record_usage("openai", "text-embedding-3-small", 100, 0, embedding_tokens=100)
+        assert r["embedding_tokens"] == 100
+
+    def test_tool_calls(self):
+        l = TokenLedger()
+        tools = [{"name": "get_weather", "tokens": 50}]
+        r = l.record_usage("openai", "gpt-4o", 100, 50, tool_calls=tools)
+        assert r["tool_call_count"] == 1
+
+    def test_media_type(self):
+        l = TokenLedger()
+        r = l.record_usage("openai", "gpt-4o", 1000, 200, media_type="image")
+        assert r["media_type"] == "image"
+
+    def test_efficiency_stats(self):
+        l = TokenLedger()
+        l.record_usage("openai", "gpt-4o", 200, 100)
+        l.record_usage("openai", "gpt-4o", 100, 100, cache_hit=True)
+        eff = l.get_efficiency()
+        assert eff["cache_hit_rate"] > 0
+        assert eff["avg_efficiency"] > 0
+
+    def test_custom_status(self):
+        l = TokenLedger()
+        r = l.record_usage("openai", "gpt-4o", 100, 50, status="streaming")
+        assert r["status"] == "streaming"
+
+
+class TestRetention:
+    def test_apply_retention(self):
+        l = TokenLedger()
+        l.record_usage("openai", "gpt-4o", 100, 50)
+        # max_age_days=0 removes records older than the current moment
+        # give it a 1s window to ensure the record is "older"
+        import time; time.sleep(0.01)
+        l.apply_retention(max_age_days=0)
+        assert len(l.get_records()) == 0
+
+    def test_max_records_ring(self):
+        l = TokenLedger(max_records=5)
+        for _ in range(10):
+            l.record_usage("openai", "gpt-4o", 10, 5)
+        assert len(l.get_records()) == 5
+
+    def test_retention_preserves_recent(self):
+        l = TokenLedger(max_records=100, retention_days=365)
+        l.record_usage("openai", "gpt-4o", 10, 5)
+        l.apply_retention(max_age_days=365)
+        assert len(l.get_records()) == 1
+
+
+class TestImmutability:
+    def test_checksum_on_insert(self):
+        l = TokenLedger()
+        r = l.record_usage("openai", "gpt-4o", 100, 50)
+        stored = l.get_records()[0]
+        assert "_checksum" in stored
+
+    def test_immutability_verify_clean(self):
+        l = TokenLedger()
+        l.record_usage("openai", "gpt-4o", 100, 50)
+        assert l.verify_immutability() == []
+
+    def test_immutability_detect_tamper(self):
+        l = TokenLedger()
+        l.record_usage("openai", "gpt-4o", 100, 50)
+        stored = l.get_records()[0]
+        stored["output_tokens"] = 99999
+        tampered = l.store.verify_immutability()
+        assert len(tampered) == 1
+
+    def test_persist_immutable_jsonl(self):
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".jsonl") as f:
+            p = f.name
+        try:
+            l = TokenLedger(persist_path=p)
+            l.record_usage("openai", "gpt-4o", 100, 50)
+            l2 = TokenLedger(persist_path=p)
+            assert l2.verify_immutability() == []
+        finally:
+            os.unlink(p)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -174,6 +174,8 @@ class InterceptionLayer:
             "user_id": kwargs.get("user_id", "anonymous"),
             "project_id": kwargs.get("project_id", "default"),
             "model": kwargs.get("model", "unknown"),
+            "conversation_id": kwargs.get("conversation_id"),
+            "agent_id": kwargs.get("agent_id"),
         }
 
     def _budget_check(self, metadata: Dict[str, Any], provider: str, messages: list) -> None:
@@ -213,6 +215,10 @@ class InterceptionLayer:
             "status": "success",
             "source": token_data.get("source", "api_reported"),
         }
+        if metadata.get("conversation_id"):
+            record["conversation_id"] = metadata["conversation_id"]
+        if metadata.get("agent_id"):
+            record["agent_id"] = metadata["agent_id"]
         if not self.pricing.has_model(provider, metadata["model"]):
             if self.unknown_model_policy == "block":
                 raise UnknownModelError(f"Unknown model: {provider}:{metadata['model']}")

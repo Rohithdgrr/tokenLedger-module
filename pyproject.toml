@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tokenledger"
-version = "1.0.0"
+version = "1.2.0"
 description = "Lightweight governance layer for LLM applications - zero database required"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.9"
 authors = [
     {name = "TokenLedger Team", email = "team@tokenledger.dev"}
@@ -16,7 +16,6 @@ keywords = ["llm", "tokens", "cost-tracking", "budget", "openai", "anthropic", "
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
@@ -45,9 +44,11 @@ all = [
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    "pytest-benchmark>=4.0.0",
     "black>=23.0.0",
     "flake8>=6.0.0",
     "mypy>=1.0.0",
+    "bandit>=1.7.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -73,3 +74,6 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
+
+[tool.bandit]
+exclude_dirs = ["tests"]

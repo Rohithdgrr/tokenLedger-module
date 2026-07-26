@@ -124,6 +124,44 @@ class AnalyticsEngine:
             "reset_cycle": budget.get("reset_cycle", "monthly"),
         }
 
+    def get_efficiency_stats(self, scope: str = "global", scope_id: str = "all") -> Dict[str, Any]:
+        """Token efficiency metrics (output/input ratio, cache hit rate)."""
+        records = [r for r in self.store.get_records() if self._matches_dimension(r, scope, scope_id)]
+        if not records:
+            return {"avg_efficiency": 0, "cache_hit_rate": 0, "total_reasoning_tokens": 0}
+
+        ratios = []
+        cache_hits = 0
+        total_reasoning = 0
+        for r in records:
+            inp = r.get("input_tokens", 0) or 1
+            ratios.append(r.get("output_tokens", 0) / inp)
+            if r.get("cache_hit"):
+                cache_hits += 1
+            total_reasoning += r.get("reasoning_tokens", 0)
+
+        ratios.sort()
+        n = len(ratios)
+        return {
+            "avg_efficiency": round(sum(ratios) / n, 4),
+            "p50_efficiency": round(ratios[n // 2], 4),
+            "cache_hit_rate": round(cache_hits / n, 4),
+            "total_reasoning_tokens": total_reasoning,
+        }
+
+    def get_cost_breakdown(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Breakdown of costs by category (completion, cache, embedding, etc.)."""
+        total = {"completion": 0.0, "cached": 0.0, "embedding": 0.0, "tool_calls": 0.0, "media": 0.0}
+        for r in records:
+            cost = r.get("cost_usd", 0)
+            if r.get("embedding"):
+                total["embedding"] += cost
+            elif r.get("cache_hit"):
+                total["cached"] += cost * 0.5
+            else:
+                total["completion"] += cost
+        return total
+
     def _matches_dimension(self, record: Dict[str, Any], dimension: str, dimension_id: str) -> bool:
         """Check if a record matches a dimension filter."""
         if dimension == "global":
@@ -136,6 +174,10 @@ class AnalyticsEngine:
             return record.get("user_id", "anonymous") == dimension_id
         if dimension == "project":
             return record.get("project_id", "default") == dimension_id
+        if dimension == "conversation":
+            return record.get("conversation_id") == dimension_id
+        if dimension == "agent":
+            return record.get("agent_id") == dimension_id
         return False
 
     def _matches_budget_scope(self, record: Dict[str, Any], budget: Dict[str, Any]) -> bool:

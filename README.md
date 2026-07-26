@@ -23,6 +23,10 @@ The package works by **wrapping LLM API calls**. When a request is made, TokenLe
 - **Resilience** — Configurable retry with backoff, circuit breaker (per-provider), rate limiter (token bucket), and request timeout.
 - **Zero Database** — Everything runs in-memory. Optional append-only JSONL file for cross-session durability.
 - **Minimal Code Changes** — Drop-in wrappers. No refactoring required.
+- **AI-Specific Tracking** — Track conversation_id, agent_id, reasoning tokens, cache hits, embedding tokens, tool calls, and media generation costs.
+- **Prompt Fingerprinting** — Deterministic SHA-256 hashing for prompt deduplication and caching analytics.
+- **Data Retention** — Configurable max_records ring buffer and age-based retention policies.
+- **Immutable Event Logs** — SHA-256 checksums on all records with tamper detection and verification.
 - **Export** — Generate CSV or JSON reports for auditing and analysis.
 
 ---
@@ -117,6 +121,97 @@ ledger.export_json("usage_report.json")
 
 ## Advanced Usage
 
+### AI-Specific Tracking
+
+```python
+ledger.record_usage(
+    provider="openai",
+    model="gpt-4o",
+    input_tokens=150,
+    output_tokens=75,
+    user_id="alice",
+    project_id="my-app",
+    conversation_id="conv-123",       # cost per conversation
+    agent_id="customer-support",      # cost per agent/assistant
+    reasoning_tokens=30,              # chain-of-thought tokens
+    cached_input_tokens=80,           # cache-hit input tokens
+    embedding_tokens=100,             # embedding model tokens
+    tool_calls=[{"name": "get_weather", "tokens": 50}],  # tool attribution
+    media_type="image",               # generation type
+    cache_hit=True,                   # cache-hit flag for cost analysis
+    prompt_hash="abc123...",          # pre-computed prompt fingerprint
+)
+```
+
+### Prompt Fingerprinting
+
+```python
+from tokenledger import TokenLedger
+
+messages = [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "What's the weather in Paris?"},
+]
+fp = TokenLedger.fingerprint_prompt(messages)
+
+ledger.record_usage("openai", "gpt-4o", 100, 50, prompt_hash=fp)
+```
+
+### Per-Conversation Analytics
+
+```python
+# Ask the ledger to apply a conversation_id (interceptor path)
+response = wrapped.chat.completions.create(
+    model="gpt-4o",
+    messages=[...],
+    user_id="alice",
+    conversation_id="conv-456",
+)
+# Query cost by conversation
+for row in ledger.get_spending_by_conversation():
+    print(f"{row['id']}: ${row['cost_usd']:.4f}")
+```
+
+### Per-Agent Analytics
+
+```python
+response = wrapped.chat.completions.create(
+    model="gpt-4o",
+    messages=[...],
+    agent_id="billing-assistant",
+)
+for row in ledger.get_spending_by_agent():
+    print(f"{row['id']}: ${row['cost_usd']:.4f}")
+```
+
+### Efficiency Metrics
+
+```python
+eff = ledger.get_efficiency()
+print(f"Efficiency ratio: {eff['avg_efficiency']:.2f}")  # output/input
+print(f"Cache hit rate: {eff['cache_hit_rate']:.1%}")
+print(f"Reasoning tokens: {eff['total_reasoning_tokens']}")
+```
+
+### Data Retention
+
+```python
+# Ring buffer: keep at most 10k records
+ledger = TokenLedger(max_records=10_000, retention_days=90)
+
+# Manual age-based purge
+ledger.apply_retention(max_age_days=30)
+```
+
+### Immutability Verification
+
+```python
+# Every record is SHA-256 checksummed at insert
+tampered = ledger.verify_immutability()
+if tampered:
+    print(f"Tampered record IDs: {tampered}")
+```
+
 ### Custom Pricing
 
 ```python
@@ -173,11 +268,9 @@ from tokenledger import TokenLedger
 from tokenledger.core.system import SystemMonitor
 
 monitor = SystemMonitor(collection_interval=10.0)
-monitor.start()  # begins background collection
+monitor.start()
 
 ledger = TokenLedger(system_monitor=monitor)
-
-# Attach system snapshot to a usage record
 ledger.record_usage("openai", "gpt-4o", 150, 75, system_context=True)
 ```
 
@@ -216,20 +309,24 @@ Records that fail critical checks are rejected. Minor mismatches are auto-correc
 
 ```
 tokenledger/
-├── __init__.py              # Public API
+├── __init__.py              # Public API (TokenLedger, MemoryStore, errors)
 ├── core/
 │   ├── ledger.py            # Main TokenLedger class
-│   ├── store.py             # In-memory storage engine
+│   ├── store.py             # In-memory store with ring buffer, retention, checksums
 │   ├── interceptor.py       # API wrapping, retry, circuit breaker, rate limiter
 │   ├── budget.py            # Budget rules & enforcement
 │   ├── pricing.py           # Pricing registry (16 providers)
 │   ├── extractor.py         # Token extraction per provider
 │   ├── estimator.py         # Token estimation fallback
 │   ├── verifier.py          # Data integrity & verification
-│   ├── analytics.py         # Aggregation & reporting
+│   ├── analytics.py         # Aggregation, efficiency, cost breakdown
 │   └── system.py            # System monitoring (CPU/GPU/RAM/disk/network)
-└── utils/
-    └── export.py            # CSV / JSON export
+├── utils/
+│   └── export.py            # CSV / JSON export
+└── tests/
+    ├── test_ledger.py       # Unit tests, edge cases, AI features, retention, immutability
+    ├── test_system.py       # System monitor tests
+    └── test_benchmark.py    # Performance benchmarks
 ```
 
 ---
@@ -241,8 +338,8 @@ tokenledger/
 | `persist_path` | `str` | `None` | Path to append-only JSONL file |
 | `unknown_model_policy` | `str` | `"estimate"` | `"estimate"`, `"block"`, or `"allow"` |
 | `system_monitor` | `SystemMonitor` | `None` | Optional system metrics collector |
-| `anonymize_ids` | `bool` | `False` | Hash user/project identifiers |
-| `max_records_in_memory` | `int` | `100000` | Auto-archive older records |
+| `max_records` | `int` | `100000` | Ring buffer capacity (oldest evicted when full) |
+| `retention_days` | `int` | `90` | Max age in days before auto-purge |
 
 Interceptor configuration (set after init):
 

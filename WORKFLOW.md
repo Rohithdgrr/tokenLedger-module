@@ -60,6 +60,8 @@ metadata = {
     "model": kwargs.get("model", "unknown"),
     "provider": provider,
     "messages": kwargs.get("messages", []),
+    "conversation_id": kwargs.get("conversation_id"),
+    "agent_id": kwargs.get("agent_id"),
 }
 ```
 
@@ -170,15 +172,28 @@ record = {
     "project_id": project_id,
     "status": "success",
     "source": source,
-    "system": { ... },  # Optional
+    "system": { ... },              # Optional
+    "conversation_id": "...",       # Optional (per-conversation tracking)
+    "agent_id": "...",              # Optional (per-agent tracking)
+    "prompt_hash": "sha256...",     # Optional (prompt fingerprint)
+    "reasoning_tokens": 30,         # Optional (o1 chain-of-thought)
+    "cached_input_tokens": 80,      # Optional (cache-hit input)
+    "embedding_tokens": 100,        # Optional (embedding model usage)
+    "tool_call_count": 3,           # Optional (tool-call attribution)
+    "tool_calls": [...],            # Optional
+    "media_type": "image",          # Optional (generation type)
+    "cache_hit": True,              # Optional (cache flag)
+    "_checksum": "sha256...",       # Immutability hash (auto, internal)
 }
 ```
 
 ### Step 4.7: Storage
 
-1. In-memory append via `store.records.append(record)`
-2. Running totals update for O(1) analytics
-3. Optional JSONL file append
+1. SHA-256 checksum computed and attached to record (`_checksum`)
+2. In-memory append via ring buffer (`deque` with configurable `maxlen`)
+3. Running totals update for O(1) analytics
+4. Age-based retention check (`_apply_retention` prunes records older than `retention_days`)
+5. Optional JSONL file append with `checksum:json\n` format for tamper-proof persistence
 
 ---
 
@@ -375,7 +390,15 @@ ledger.record_usage(
     input_tokens=response.prompt_tokens,
     output_tokens=response.completion_tokens,
     user_id="alice",
-    project_id="my-app"
+    project_id="my-app",
+    conversation_id="conv-789",            # optional
+    agent_id="support-assistant",           # optional
+    reasoning_tokens=30,                    # optional
+    cached_input_tokens=80,                 # optional
+    embedding_tokens=100,                   # optional
+    tool_calls=[{"name": "get_weather"}],   # optional
+    media_type="image",                     # optional
+    cache_hit=True,                         # optional
 )
 ```
 
@@ -425,16 +448,20 @@ async for chunk in await wrapped_async.chat.completions.create(
 
 | Scenario | Pre-Flight | Token Source | System Context | Storage | Notes |
 |----------|-----------|--------------|---------------|---------|-------|
-| OpenAI sync | Rate limit + circuit + budget | API usage | Auto if monitor set | Immediate | Standard path |
-| OpenAI async | Same | API usage | Auto if monitor set | Immediate | Detected via iscoroutinefunction |
+| OpenAI sync | Rate limit + circuit + budget | API usage | Auto if monitor set | Ring buffer + checksum + retention | Standard path |
+| OpenAI async | Same | API usage | Auto if monitor set | Same | Detected via iscoroutinefunction |
 | OpenAI stream | Same | Post-stream | Auto if monitor set | After stream | No chunk buffering |
-| Anthropic | Same | API usage | Auto if monitor set | Immediate | Claude-specific parser |
-| Cohere | Same | API usage | Auto if monitor set | Immediate | billed_units parser |
-| Ollama | Same | Estimated | Auto if monitor set | Immediate | Always estimated |
-| Custom API | Manual call | Manual input | Manual via record_usage | Immediate | Developer provides counts |
+| Anthropic | Same | API usage | Auto if monitor set | Same | Claude-specific parser |
+| Cohere | Same | API usage | Auto if monitor set | Same | billed_units parser |
+| Ollama | Same | Estimated | Auto if monitor set | Same | Always estimated |
+| Custom API | Manual call | Manual input | Manual via record_usage | Same | Developer provides counts |
 | Budget exceeded | Blocks call | N/A | N/A | Blocked record only | No API charges |
 | Circuit open | Blocks call | N/A | N/A | N/A | No API charges |
 | API error | Passed through | N/A | N/A | Not stored | Exception propagates after retries |
+
+### Immutability & Integrity
+
+Every record incorporates a `_checksum` field (SHA-256 of the serialized record) at insert time. The JSONL persistence format embeds the checksum as a prefix per line: `checksum:json\n`, enabling tamper detection on reload. Call `verify_immutability()` to return a list of tampered `record_id`s.
 
 ---
 
