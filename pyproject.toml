@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokenledger"
+version = "1.0.0"
+description = "Lightweight governance layer for LLM applications - zero database required"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "TokenLedger Team", email = "team@tokenledger.dev"}
+]
+keywords = ["llm", "tokens", "cost-tracking", "budget", "openai", "anthropic", "ai-governance"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+openai = ["openai>=1.0.0"]
+anthropic = ["anthropic>=0.18.0"]
+google = ["google-generativeai>=0.3.0"]
+groq = ["groq>=0.4.0"]
+ollama = ["ollama>=0.1.0"]
+tiktoken = ["tiktoken>=0.5.0"]
+all = [
+    "openai>=1.0.0",
+    "anthropic>=0.18.0",
+    "google-generativeai>=0.3.0",
+    "groq>=0.4.0",
+    "ollama>=0.1.0",
+    "tiktoken>=0.5.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["tokenLedger"]
+
+[project.urls]
+Homepage = "https://github.com/your-org/tokenledger"
+Repository = "https://github.com/your-org/tokenledger.git"
+Issues = "https://github.com/your-org/tokenledger/issues"
+
+[tool.black]
+line-length = 100
+target-version = ['py39', 'py310', 'py311', 'py312']
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
