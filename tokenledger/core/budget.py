@@ -89,17 +89,34 @@ class BudgetEnforcer:
         return budgets
 
     def _calculate_current_spend(self, budget: Dict[str, Any]) -> float:
-        """Calculate current spend for a budget rule."""
+        """Calculate current spend using running totals (O(1))."""
         reset_cycle = budget.get("reset_cycle", "monthly")
         window_start = self._get_window_start(reset_cycle)
 
-        total = 0.0
-        for record in self.store.get_records():
-            if record.get("timestamp", "") >= window_start:
-                if self._record_matches_budget(record, budget):
-                    total += record.get("cost_usd", 0.0)
+        scope = budget.get("scope", "global")
+        scope_id = budget.get("scope_id", "")
 
-        return round(total, 10)
+        if scope == "global":
+            key = "global:all"
+        elif scope in ("project", "user"):
+            key = f"{scope}:{scope_id}"
+        elif scope == "user_project":
+            parts = scope_id.split(":")
+            if len(parts) == 2:
+                key_user = f"user:{parts[0]}"
+                key_project = f"project:{parts[1]}"
+                user_totals = self.store.running_totals.get(key_user, {})
+                project_totals = self.store.running_totals.get(key_project, {})
+                return round(
+                    max(user_totals.get("cost_usd", 0), project_totals.get("cost_usd", 0)),
+                    10,
+                )
+            return 0.0
+        else:
+            return 0.0
+
+        totals = self.store.running_totals.get(key, {})
+        return round(totals.get("cost_usd", 0), 10)
 
     def _get_window_start(self, reset_cycle: str) -> str:
         """Get the start of the current budget window."""

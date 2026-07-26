@@ -1,6 +1,7 @@
 """Method wrapping and monkey-patching for LLM clients."""
 
 import asyncio
+import logging
 import time
 import uuid
 from datetime import datetime, timezone
@@ -13,9 +14,35 @@ from .pricing import PricingRegistry
 from .store import MemoryStore
 from .verifier import VerificationEngine
 
+logger = logging.getLogger(__name__)
+
+TRACKING_KWARGS = {"user_id", "project_id", "conversation_id", "agent_id"}
+
 
 class CircuitBreakerOpenError(Exception):
     """Raised when circuit breaker is open for a provider."""
+
+
+class TokenBucket:
+    """Simple token bucket rate limiter."""
+
+    def __init__(self, rate: float):
+        self.rate = rate
+        self.tokens = rate
+        self.last = time.monotonic()
+
+    def consume(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self.last
+        self.tokens = min(self.rate, self.tokens + elapsed * self.rate)
+        self.last = now
+        if self.tokens < 1:
+            sleep = (1 - self.tokens) / self.rate
+            time.sleep(sleep)
+            self.tokens = 0
+            self.last = time.monotonic()
+        else:
+            self.tokens -= 1
 
 
 class InterceptionLayer:
@@ -54,7 +81,11 @@ class InterceptionLayer:
         self.rate_limit_rps = rate_limit_rps
         self._original_methods: Dict[int, Dict[str, Callable]] = {}
         self._circuit_state: Dict[str, Dict] = {}
-        self._rate_buckets: Dict[str, float] = {}
+        self._rate_buckets: Dict[str, TokenBucket] = {}
+
+    def _strip_tracking_kwargs(self, kwargs: Dict[str, Any]) -> None:
+        for key in TRACKING_KWARGS:
+            kwargs.pop(key, None)
 
     def _make_tracked_fn(self, original: Callable, provider: str) -> Callable:
         if asyncio.iscoroutinefunction(original):
@@ -89,10 +120,16 @@ class InterceptionLayer:
         return self._wrap_attr(client, "chat.completions.create", "groq")
 
     def wrap_gemini(self, client: Any) -> Any:
-        return client
+        try:
+            from google.genai import types
+            original = client.models.generate_content
+            return self._wrap_attr(client, "models.generate_content", "google")
+        except ImportError:
+            logger.warning("google-genai not installed; wrap_gemini requires `pip install google-generativeai`")
+            return client
 
     def wrap_ollama(self, client: Any) -> Any:
-        return client
+        return self._wrap_attr(client, "chat", "ollama")
 
     def unwrap(self, client: Any) -> Any:
         client_id = id(client)
@@ -127,15 +164,14 @@ class InterceptionLayer:
                 state["since"] = time.monotonic()
 
     def _check_rate_limit(self, provider: str) -> None:
-        now = time.monotonic()
-        last = self._rate_buckets.get(provider, 0.0)
-        elapsed = now - last
-        min_interval = 1.0 / self.rate_limit_rps
-        if elapsed < min_interval:
-            time.sleep(min_interval - elapsed)
-        self._rate_buckets[provider] = time.monotonic()
+        bucket = self._rate_buckets.get(provider)
+        if bucket is None:
+            bucket = TokenBucket(self.rate_limit_rps)
+            self._rate_buckets[provider] = bucket
+        bucket.consume()
 
     def _call_with_retry(self, original: Callable, args: tuple, kwargs: Dict[str, Any], provider: str, timeout: Optional[float] = None) -> Any:
+        self._strip_tracking_kwargs(kwargs)
         delay = self.retry_delay
         for attempt in range(self.max_retries + 1):
             try:
@@ -144,6 +180,7 @@ class InterceptionLayer:
                 return original(*args, **kwargs)
             except (ConnectionError, TimeoutError, CircuitBreakerOpenError):
                 if attempt < self.max_retries:
+                    logger.warning("Retry %d/%d for %s after transient error", attempt + 1, self.max_retries, provider)
                     time.sleep(delay)
                     delay *= 2
                 else:
@@ -152,6 +189,7 @@ class InterceptionLayer:
                 raise
 
     async def _call_with_retry_async(self, original: Callable, args: tuple, kwargs: Dict[str, Any], provider: str, timeout: Optional[float] = None) -> Any:
+        self._strip_tracking_kwargs(kwargs)
         delay = self.retry_delay
         for attempt in range(self.max_retries + 1):
             try:
@@ -162,6 +200,7 @@ class InterceptionLayer:
                 return await original(*args, **kwargs)
             except (ConnectionError, TimeoutError, asyncio.TimeoutError, CircuitBreakerOpenError):
                 if attempt < self.max_retries:
+                    logger.warning("Async retry %d/%d for %s", attempt + 1, self.max_retries, provider)
                     await asyncio.sleep(delay)
                     delay *= 2
                 else:

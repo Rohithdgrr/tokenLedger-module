@@ -5,11 +5,14 @@ immutable event logs, and optional JSONL file persistence.
 
 import hashlib
 import json
+import logging
 import os
 import threading
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Deque, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class RetentionPolicy:
@@ -107,7 +110,7 @@ class MemoryStore:
                 f.flush()
                 os.fsync(f.fileno())
         except (IOError, OSError) as e:
-            print(f"Warning: Failed to persist record: {e}")
+            logger.warning("Failed to persist record: %s", e)
 
     def _load_from_disk(self) -> None:
         """Load and verify records from disk."""

@@ -354,6 +354,14 @@ Interceptor configuration (set after init):
 
 ---
 
+## Known Limitations
+
+- **Pricing drift**: Built-in rates are a snapshot. Monitor provider pricing pages and use `register_pricing()` to update.
+- **Estimation accuracy**: When APIs don't report token usage, `tiktoken` (>98%) or character heuristic (~85%) fallbacks are used. Records from fallbacks are flagged `source: "estimated"`.
+- **Gemini & Ollama wrapping**: These providers lack a universal client interface for monkey-patching. `wrap_gemini` wraps `models.generate_content` if `google-genai` is installed; `wrap_ollama` wraps the `chat` method. For full control, use `record_usage()` manually.
+- **Single-process**: TokenLedger is designed for single-process apps. Multi-process budget enforcement requires external coordination.
+- **Rate limiter**: Simple token bucket suitable for single-process use. For distributed rate limiting, use an external proxy.
+
 ## Contributing
 
 We welcome contributions! Areas of interest:

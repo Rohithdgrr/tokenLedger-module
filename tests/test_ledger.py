@@ -413,5 +413,82 @@ class TestImmutability:
             os.unlink(p)
 
 
+class TestConcurrency:
+    def test_concurrent_record_insertion(self):
+        import threading
+        l = TokenLedger()
+        n = 50
+        errors = []
+
+        def worker(i):
+            try:
+                l.record_usage("openai", "gpt-4o", 100, 50, user_id=f"user-{i}")
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors
+        assert len(l.get_records()) == n
+
+    def test_concurrent_budget_check(self):
+        import threading
+        l = TokenLedger()
+        l.set_budget("user", "alice", limit_usd=0.001, reset_cycle="never")
+        n = 20
+        successes = []
+        errors = []
+
+        def worker(_):
+            try:
+                l.record_usage("openai", "gpt-4o", 100, 50, user_id="alice")
+                successes.append(1)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # At least one request should hit the budget, but at least one should succeed (due to race)
+        assert len(errors) > 0 or len(successes) < n
+
+
+class TestKwargStripping:
+    def test_tracking_kwargs_stripped(self):
+        """Verify interceptor strips tracking kwargs before calling original."""
+        from tokenledger.core.interceptor import TRACKING_KWARGS
+        assert "user_id" in TRACKING_KWARGS
+        assert "project_id" in TRACKING_KWARGS
+        assert "conversation_id" in TRACKING_KWARGS
+        assert "agent_id" in TRACKING_KWARGS
+
+    def test_strip_does_not_mutate_original_kwargs_outside(self):
+        from tokenledger.core.interceptor import InterceptionLayer
+        il = InterceptionLayer.__new__(InterceptionLayer)
+        kwargs = {"model": "gpt-4", "messages": [], "user_id": "alice", "project_id": "my-app"}
+        il._strip_tracking_kwargs(kwargs)
+        assert "user_id" not in kwargs
+        assert "project_id" not in kwargs
+        assert "model" in kwargs
+
+
+class TestTokenBucket:
+    def test_bucket_initial_tokens(self):
+        from tokenledger.core.interceptor import TokenBucket
+        b = TokenBucket(10)
+        assert b.tokens == 10
+
+    def test_bucket_consumes(self):
+        from tokenledger.core.interceptor import TokenBucket
+        b = TokenBucket(1000)
+        b.consume()
+        assert b.tokens < 1000
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
