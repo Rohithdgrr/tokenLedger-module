@@ -51,12 +51,12 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-where = ["tokenLedger"]
+include = ["tokenledger", "tokenledger.*"]
 
 [project.urls]
-Homepage = "https://github.com/your-org/tokenledger"
-Repository = "https://github.com/your-org/tokenledger.git"
-Issues = "https://github.com/your-org/tokenledger/issues"
+Homepage = "https://github.com/Rohithdgrr/tokenLedger-module"
+Repository = "https://github.com/Rohithdgrr/tokenLedger-module.git"
+Issues = "https://github.com/Rohithdgrr/tokenLedger-module/issues"
 
 [tool.black]
 line-length = 100
