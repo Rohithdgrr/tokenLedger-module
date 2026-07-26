@@ -176,14 +176,22 @@ class InterceptionLayer:
         return self._wrap_attr(client, "chat.completions.create", "groq")
 
     def wrap_gemini(self, client: Any) -> Any:
-        try:
-            return self._wrap_attr(client, "models.generate_content", "google")
-        except AttributeError:
-            logger.warning("wrap_gemini: client has no 'models.generate_content'; use record_usage() manually")
-            return client
+        for attr in ("models.generate_content", "generate_content"):
+            try:
+                return self._wrap_attr(client, attr, "google")
+            except AttributeError:
+                continue
+        logger.warning("wrap_gemini: client has no 'generate_content'; use record_usage() manually")
+        return client
 
     def wrap_ollama(self, client: Any) -> Any:
-        return self._wrap_attr(client, "chat", "ollama")
+        for attr in ("chat", "generate"):
+            try:
+                return self._wrap_attr(client, attr, "ollama")
+            except AttributeError:
+                continue
+        logger.warning("wrap_ollama: client has no 'chat' or 'generate'; use record_usage() manually")
+        return client
 
     def unwrap(self, client: Any) -> Any:
         client_id = id(client)

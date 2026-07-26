@@ -3,6 +3,7 @@ Analytics and aggregation engine.
 Pure Python queries with O(1) lookups via running totals.
 """
 
+from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional
 
 from .store import MemoryStore
@@ -18,8 +19,45 @@ class AnalyticsEngine:
         self.store = store
 
     def get_summary(self, scope: str = "global", scope_id: str = "all") -> Dict[str, Any]:
-        """Get summary statistics for a scope."""
-        return self.store.get_running_totals(scope, scope_id)
+        """Get summary statistics with budget utilization, top models, and anomalies."""
+        base = self.store.get_running_totals(scope, scope_id)
+        records = self.store.get_records()
+        budgets = self.store.get_all_budgets()
+
+        base["budget_count"] = len(budgets)
+
+        budget_utilization = {}
+        for bk, b in budgets.items():
+            spend_key = f"{b.get('scope','global')}:{b.get('scope_id','all')}"
+            spend = self.store.get_running_totals(b.get('scope','global'), b.get('scope_id','all'))
+            limit = b.get("limit_usd", 0)
+            budget_utilization[bk] = {
+                "spend": round(spend.get("cost_usd", 0), 6),
+                "limit": limit,
+                "utilization_pct": round(spend.get("cost_usd", 0) / limit * 100, 2) if limit else 0,
+            }
+        base["budget_utilization"] = budget_utilization
+
+        model_totals: Dict[str, int] = defaultdict(int)
+        provider_totals: Dict[str, int] = defaultdict(int)
+        status_counts: Counter = Counter()
+        for r in records:
+            model_totals[r.get("model", "unknown")] += r.get("total_tokens", 0)
+            provider_totals[r.get("provider", "unknown")] += r.get("total_tokens", 0)
+            status_counts[r.get("status", "success")] += 1
+
+        top_models = sorted(model_totals.items(), key=lambda x: -x[1])[:5]
+        base["top_models"] = [{"model": m, "tokens": t} for m, t in top_models]
+        base["top_providers"] = sorted(
+            [{"provider": p, "tokens": t} for p, t in provider_totals.items()],
+            key=lambda x: -x["tokens"],
+        )[:5]
+        base["status_breakdown"] = dict(status_counts)
+
+        status_counts.pop("success", None)
+        base["anomalies"] = {"non_success_count": sum(status_counts.values())}
+
+        return base
 
     def get_spending_by_dimension(self, dimension: str) -> List[Dict[str, Any]]:
         """Get spending breakdown by a dimension."""

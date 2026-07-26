@@ -246,3 +246,166 @@ class TestOnBudgetThreshold:
         calls = []
         ledger.interceptor.on_budget_threshold = lambda s, sid, c, l: calls.append((s, sid, c, l))
         assert ledger.interceptor.on_budget_threshold is not None
+
+
+class TestPricingExternal:
+    def test_pricing_loads_from_builtin(self):
+        from tokenledger.core.pricing import PricingRegistry
+        pr = PricingRegistry()
+        assert pr.has_model("openai", "gpt-4o")
+        assert not pr.has_model("openai", "nonexistent")
+
+    def test_pricing_from_file(self):
+        from tokenledger.core.pricing import PricingRegistry
+        import json, tempfile
+        data = {"_meta": {"version": 1, "last_updated": "2026-07-26"}, "testprov": {"testmodel": {"input_per_1k": 1.0, "output_per_1k": 2.0}}}
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(data, f)
+            path = f.name
+        try:
+            pr = PricingRegistry(pricing_file=path)
+            assert pr.has_model("testprov", "testmodel")
+            p = pr.get_pricing("testprov", "testmodel")
+            assert p["input_per_token"] == 0.001
+            assert p["output_per_token"] == 0.002
+        finally:
+            os.unlink(path)
+
+    def test_pricing_last_updated(self):
+        from tokenledger.core.pricing import PricingRegistry
+        import json, tempfile
+        data = {"_meta": {"version": 1, "last_updated": "2026-07-26"}, "testprov": {"testmodel": {"input_per_1k": 0.5, "output_per_1k": 0.5}}}
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(data, f)
+            path = f.name
+        try:
+            pr = PricingRegistry(pricing_file=path)
+            assert pr.get_last_updated() == "2026-07-26"
+        finally:
+            os.unlink(path)
+
+    def test_update_pricing_cli(self):
+        from tokenledger.__main__ import cmd_update_pricing
+        import json, tempfile
+        data = {"_meta": {"version": 1}, "clitest": {"m1": {"input_per_1k": 0.1, "output_per_1k": 0.2}}}
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(data, f)
+            path = f.name
+        try:
+            class Args:
+                file = path
+            cmd_update_pricing(Args())
+        finally:
+            os.unlink(path)
+
+
+class TestTrackDecorator:
+    def test_track_decorator_records_usage(self):
+        from tokenledger import TokenLedger
+        ledger = TokenLedger()
+
+        @ledger.track(provider="test", model="t1", user_id="u1", project_id="p1",
+                       input_tokens=10, output_tokens=5)
+        def my_func():
+            return "ok"
+
+        result = my_func()
+        assert result == "ok"
+        records = ledger.get_records()
+        assert len(records) == 1
+        assert records[0]["input_tokens"] == 10
+        assert records[0]["output_tokens"] == 5
+        assert records[0]["user_id"] == "u1"
+        assert records[0]["project_id"] == "p1"
+
+    def test_track_decorator_extracts_from_response(self):
+        from tokenledger import TokenLedger
+        from unittest.mock import MagicMock
+        ledger = TokenLedger()
+
+        class FakeResponse:
+            usage = MagicMock(prompt_tokens=7, completion_tokens=3)
+
+        @ledger.track(provider="openai", model="gpt-4")
+        def call_api():
+            return FakeResponse()
+
+        call_api()
+        records = ledger.get_records()
+        assert len(records) == 1
+        assert records[0]["input_tokens"] == 7
+        assert records[0]["output_tokens"] == 3
+
+
+class TestRicherSummary:
+    def test_summary_includes_budgets(self):
+        from tokenledger import TokenLedger
+        ledger = TokenLedger()
+        ledger.set_budget("user", "alice", limit_usd=10.0)
+        ledger.record_usage(provider="test", model="t1", input_tokens=10, output_tokens=5,
+                             user_id="alice")
+        summary = ledger.get_summary()
+        assert "budget_utilization" in summary
+        assert "top_models" in summary
+        assert "status_breakdown" in summary
+        assert "anomalies" in summary
+
+    def test_summary_top_models(self):
+        from tokenledger import TokenLedger
+        ledger = TokenLedger()
+        for i in range(3):
+            ledger.record_usage(provider="test", model=f"m{i}", input_tokens=10, output_tokens=5)
+        summary = ledger.get_summary()
+        assert len(summary["top_models"]) == 3
+
+
+class TestSqliteStore:
+    def test_insert_and_retrieve(self):
+        from tokenledger.ext.sqlite_store import SqliteStore
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db = f.name
+        try:
+            store = SqliteStore(db)
+            store.insert_record({"record_id": "r1", "provider": "test", "model": "t1",
+                                  "input_tokens": 10, "output_tokens": 5,
+                                  "total_tokens": 15, "cost_usd": 0.001,
+                                  "timestamp": "2026-07-26T00:00:00"})
+            records = store.get_records()
+            assert len(records) == 1
+            assert records[0]["record_id"] == "r1"
+        finally:
+            os.unlink(db)
+
+    def test_running_totals(self):
+        from tokenledger.ext.sqlite_store import SqliteStore
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db = f.name
+        try:
+            store = SqliteStore(db)
+            store.insert_record({"record_id": "r1", "provider": "test", "model": "t1",
+                                  "input_tokens": 10, "output_tokens": 5,
+                                  "total_tokens": 15, "cost_usd": 0.001,
+                                  "timestamp": "2026-07-26T00:00:00"})
+            totals = store.get_running_totals("provider", "test")
+            assert totals["requests"] == 1
+            assert totals["total_tokens"] == 15
+        finally:
+            os.unlink(db)
+
+    def test_get_record_count(self):
+        from tokenledger.ext.sqlite_store import SqliteStore
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db = f.name
+        try:
+            store = SqliteStore(db)
+            assert store.get_record_count() == 0
+            store.insert_record({"record_id": "r1", "provider": "test", "model": "t1",
+                                  "input_tokens": 1, "output_tokens": 1,
+                                  "total_tokens": 2, "cost_usd": 0.0,
+                                  "timestamp": "2026-07-26T00:00:00"})
+            assert store.get_record_count() == 1
+        finally:
+            os.unlink(db)

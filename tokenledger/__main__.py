@@ -68,6 +68,22 @@ def cmd_compact(args):
     print(f"Removed {result['removed']} record(s), {result['remaining']} remaining.")
 
 
+def cmd_update_pricing(args):
+    from tokenledger.core.pricing import PricingRegistry
+    path = args.file
+    if not path:
+        import os
+        builtin = os.path.join(os.path.dirname(__file__), "pricing_data.json")
+        if os.path.exists(builtin):
+            path = builtin
+    if not path:
+        print("No pricing file found. Use --file to specify one.", file=sys.stderr)
+        sys.exit(1)
+    pr = PricingRegistry(pricing_file=path)
+    count = len(pr.list_models())
+    updated = pr.get_last_updated() or "unknown"
+    print(f"Loaded {count} model pricing entries from {path} (last updated: {updated})")
+
 def cmd_health(args):
     ledger = _build_ledger(args)
     records = ledger.get_records()
@@ -108,6 +124,10 @@ def main():
 
     p_health = sub.add_parser("health", help="Show store health and stats")
     p_health.set_defaults(func=cmd_health)
+
+    p_pricing = sub.add_parser("update-pricing", help="Reload pricing from external JSON file")
+    p_pricing.add_argument("--file", "-f", help="Path to pricing JSON file (defaults to bundled data)")
+    p_pricing.set_defaults(func=cmd_update_pricing)
 
     args = parser.parse_args()
     args.func(args)

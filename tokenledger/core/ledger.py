@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 from .analytics import AnalyticsEngine
 from .budget import BudgetEnforcer
@@ -99,6 +100,43 @@ class TokenLedger:
 
     def wrap_perplexity(self, client: Any) -> Any:
         return self.interceptor.wrap_openai(client, provider="perplexity")
+
+    def track(
+        self,
+        provider: str,
+        model: str,
+        user_id: str = "anonymous",
+        project_id: str = "default",
+        **tracking_kwargs: Any,
+    ) -> Callable:
+        """Decorator that records token usage after a function call.
+
+        Usage:
+            @ledger.track(provider="openai", model="gpt-4", user_id="alice")
+            def call_llm(messages):
+                return client.chat.completions.create(model="gpt-4", messages=messages)
+        """
+        def decorator(func: Callable) -> Callable:
+            @functools.wraps(func)
+            def wrapper(*args: Any, **kwargs: Any) -> Any:
+                result = func(*args, **kwargs)
+                input_tokens = tracking_kwargs.pop("input_tokens", 0)
+                output_tokens = tracking_kwargs.pop("output_tokens", 0)
+                if not input_tokens and not output_tokens:
+                    td = self.extractor.extract(result, provider)
+                    if td:
+                        input_tokens = td.get("input_tokens", 0)
+                        output_tokens = td.get("output_tokens", 0)
+                self.record_usage(
+                    provider=provider, model=model,
+                    user_id=user_id, project_id=project_id,
+                    input_tokens=input_tokens or 0,
+                    output_tokens=output_tokens or 0,
+                    **tracking_kwargs,
+                )
+                return result
+            return wrapper
+        return decorator
 
     def record_usage(
         self,
