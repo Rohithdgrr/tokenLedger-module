@@ -21,6 +21,14 @@ The package works by **wrapping LLM API calls**. When a request is made, TokenLe
 - **System Monitoring** — Optional CPU, RAM, disk, GPU, network, temperature, and power metrics attached to usage records.
 - **Smart Estimation** — When APIs don't report token counts, TokenLedger estimates using `tiktoken` or character heuristics.
 - **Resilience** — Configurable retry with backoff, circuit breaker (per-provider), rate limiter (token bucket), and request timeout.
+- **CLI** — `tokenledger summary|export|verify|compact|health|update-pricing` from the terminal.
+- **SQLite Storage** — Optional SQLite backend via `TokenLedger(store=SqliteStore("usage.db"))`.
+- **Multi-Tenant** — `tenant_id` dimension for isolating usage across organizations or environments.
+- **Encryption-at-Rest** — XOR-encrypt persisted JSONL files with an `encryption_key`.
+- **Prompt Redaction** — `redact_prompts=True` hashes prompt content before recording.
+- **Differential Privacy** — Laplace noise injection via `differential_privacy_epsilon` parameter.
+- **Audit Export** — `export_audit_json()` wraps records in a signed envelope with checksum.
+- **@ledger.track Decorator** — `@ledger.track(provider="openai", model="gpt-4")` records any function.
 - **Zero Database** — Everything runs in-memory. Optional append-only JSONL file for cross-session durability.
 - **Minimal Code Changes** — Drop-in wrappers. No refactoring required.
 - **AI-Specific Tracking** — Track conversation_id, agent_id, reasoning tokens, cache hits, embedding tokens, tool calls, and media generation costs.
@@ -261,6 +269,68 @@ for chunk in stream:
     print(chunk.choices[0].delta.content)
 ```
 
+### CLI
+
+```bash
+tokenledger summary          # Aggregated usage
+tokenledger export --format csv -o out.csv
+tokenledger verify           # Checksum integrity
+tokenledger compact          # Force retention prune
+tokenledger health           # Store health & stats
+tokenledger update-pricing path/to/pricing.json
+```
+
+### @ledger.track Decorator
+
+```python
+@ledger.track(provider="openai", model="gpt-4")
+def ask_llm(messages):
+    return client.chat.completions.create(model="gpt-4", messages=messages)
+```
+
+### SQLite Store
+
+```python
+from tokenledger.ext.sqlite_store import SqliteStore
+
+ledger = TokenLedger(store=SqliteStore("usage.db"))
+```
+
+### Multi-Tenant
+
+```python
+ledger.record_usage("openai", "gpt-4", 100, 50, tenant_id="org-acme")
+for row in ledger.get_spending_by_tenant():
+    print(f"{row['id']}: ${row['cost_usd']:.4f}")
+```
+
+### Encryption-at-Rest
+
+```python
+ledger = TokenLedger(persist_path="usage.jsonl", encryption_key="my-secret-key")
+```
+
+### Prompt Redaction
+
+```python
+ledger = TokenLedger(redact_prompts=True)
+# prompt_hash is SHA-256'd before storage; raw prompt never persisted
+```
+
+### Differential Privacy
+
+```python
+ledger = TokenLedger(differential_privacy_epsilon=1.0)
+# Laplace noise added to token/cost fields in memory
+```
+
+### Audit Export
+
+```python
+report = ledger.export_audit_json()
+# {"exported_at": "...", "record_count": N, "_checksum": "sha256...", "records": [...]}
+```
+
 ### System Monitoring
 
 ```python
@@ -310,6 +380,7 @@ Records that fail critical checks are rejected. Minor mismatches are auto-correc
 ```
 tokenledger/
 ├── __init__.py              # Public API (TokenLedger, MemoryStore, errors)
+├── __main__.py              # CLI entry point
 ├── core/
 │   ├── ledger.py            # Main TokenLedger class
 │   ├── store.py             # In-memory store with ring buffer, retention, checksums
@@ -318,14 +389,23 @@ tokenledger/
 │   ├── pricing.py           # Pricing registry (16 providers)
 │   ├── extractor.py         # Token extraction per provider
 │   ├── estimator.py         # Token estimation fallback
-│   ├── verifier.py          # Data integrity & verification
+│   ├── verifier.py          # VerificationEngine + VerificationRule ABC + 6 built-in rules
 │   ├── analytics.py         # Aggregation, efficiency, cost breakdown
+│   ├── record.py            # Shared build_record() factory
 │   └── system.py            # System monitoring (CPU/GPU/RAM/disk/network)
+├── ext/
+│   ├── opentelemetry.py     # OpenTelemetry instrumentation
+│   ├── notifier.py          # Webhook / Slack notifier
+│   ├── async_store.py       # Threaded async store wrapper
+│   └── sqlite_store.py      # StorageBackend implementation for SQLite
 ├── utils/
-│   └── export.py            # CSV / JSON export
+│   └── export.py            # CSV / JSON / audit export
+├── pricing_data.json        # External pricing data (auto-loaded)
 └── tests/
     ├── test_ledger.py       # Unit tests, edge cases, AI features, retention, immutability
     ├── test_system.py       # System monitor tests
+    ├── test_extensions.py   # CLI, OTEL, Webhook, async, decorator, pricing, SQLite
+    ├── test_comprehensive.py # StorageBackend, multi-tenant, verifier, encryption, DP, audit, property-based
     └── test_benchmark.py    # Performance benchmarks
 ```
 
@@ -340,6 +420,13 @@ tokenledger/
 | `system_monitor` | `SystemMonitor` | `None` | Optional system metrics collector |
 | `max_records` | `int` | `100000` | Ring buffer capacity (oldest evicted when full) |
 | `retention_days` | `int` | `90` | Max age in days before auto-purge |
+| `store` | `StorageBackend` | `MemoryStore()` | Storage backend (SQLite via `SqliteStore`) |
+| `tenant_id` | `str` | `None` | Isolate usage records by tenant |
+| `encryption_key` | `str` | `None` | XOR key for JSONL-at-rest encryption |
+| `redact_prompts` | `bool` | `False` | Hash prompt content before recording |
+| `differential_privacy_epsilon` | `float` | `None` | Laplace noise scale (lower = more privacy) |
+| `on_budget_exceeded` | `callable` | `None` | Callback fired when a budget is exceeded |
+| `on_budget_threshold` | `callable` | `None` | Callback fired at configurable utilization threshold |
 
 Interceptor configuration (set after init):
 
@@ -356,11 +443,14 @@ Interceptor configuration (set after init):
 
 ## Known Limitations
 
-- **Pricing drift**: Built-in rates are a snapshot. Monitor provider pricing pages and use `register_pricing()` to update.
+- **Pricing drift**: Built-in rates are a snapshot. Monitor provider pricing pages and use `register_pricing()` to update, or load from an external JSON file.
 - **Estimation accuracy**: When APIs don't report token usage, `tiktoken` (>98%) or character heuristic (~85%) fallbacks are used. Records from fallbacks are flagged `source: "estimated"`.
 - **Gemini & Ollama wrapping**: These providers lack a universal client interface for monkey-patching. `wrap_gemini` wraps `models.generate_content` if `google-genai` is installed; `wrap_ollama` wraps the `chat` method. For full control, use `record_usage()` manually.
 - **Single-process**: TokenLedger is designed for single-process apps. Multi-process budget enforcement requires external coordination.
 - **Rate limiter**: Simple token bucket suitable for single-process use. For distributed rate limiting, use an external proxy.
+- **SQLite concurrent writes**: SqliteStore uses SQLite's default isolation — safe for single-process concurrent reads/writes; multi-process writes require an external connection pool.
+- **Encryption-at-rest**: Uses lightweight XOR cipher (not AES). Sufficient for casual privacy, not for compliance-grade requirements.
+- **Mock-only integration tests**: Provider integration tests use mocked responses. Real API credentials are needed for end-to-end provider tests.
 
 ## Contributing
 
@@ -384,9 +474,8 @@ TokenLedger is released under the **MIT License**.
 
 ## Support
 
-- **Documentation**: See `WORKFLOW.md`, `BACKEND.md`, and `ARCHITECTURE.md` for deep dives.
-- **Issues**: [GitHub Issues](https://github.com/your-org/tokenledger/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/your-org/tokenledger/discussions)
+- **Issues**: [GitHub Issues](https://github.com/Rohithdgrr/tokenLedger-module/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/Rohithdgrr/tokenLedger-module/discussions)
 
 ---
 

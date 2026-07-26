@@ -80,5 +80,13 @@ python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
 
+[tool.coverage.run]
+source = ["tokenledger"]
+omit = ["*/tests/*", "*/ext/*"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+
 [tool.bandit]
 exclude_dirs = ["tests"]

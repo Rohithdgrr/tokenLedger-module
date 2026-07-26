@@ -1,0 +1,11 @@
+site_name: TokenLedger
+site_description: Lightweight governance layer for LLM applications
+repo_url: https://github.com/Rohithdgrr/tokenLedger-module
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - API Reference: api.md
+  - Extensions: extensions.md
+  - CLI: cli.md
+  - CHANGELOG: changelog.md
+theme: readthedocs

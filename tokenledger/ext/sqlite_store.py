@@ -6,8 +6,10 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from tokenledger.core.store import StorageBackend
 
-class SqliteStore:
+
+class SqliteStore(StorageBackend):
     """Thread-safe SQLite-backed store compatible with MemoryStore's record interface.
 
     Usage:
@@ -46,12 +48,14 @@ class SqliteStore:
                         conversation_id TEXT,
                         agent_id TEXT,
                         prompt_hash TEXT,
+                        tenant_id TEXT,
                         extra TEXT
                     )
                 """)
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_ts ON records(timestamp)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_provider ON records(provider)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_user ON records(user_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_tenant ON records(tenant_id)")
                 conn.commit()
             finally:
                 conn.close()
@@ -71,6 +75,8 @@ class SqliteStore:
             ("project", record.get("project_id", "default")),
             ("month", record.get("timestamp", "")[:7]),
         ]
+        if record.get("tenant_id"):
+            dimensions.append(("tenant", record["tenant_id"]))
         for scope, scope_id in dimensions:
             key = f"{scope}:{scope_id}"
             agg = self.running_totals.setdefault(key, {
@@ -93,8 +99,8 @@ class SqliteStore:
                     INSERT OR REPLACE INTO records
                     (record_id, timestamp, provider, model, input_tokens, output_tokens,
                      total_tokens, cost_usd, latency_ms, user_id, project_id, status, source,
-                     conversation_id, agent_id, prompt_hash, extra)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     conversation_id, agent_id, prompt_hash, tenant_id, extra)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
                     record.get("record_id"),
                     record.get("timestamp"),
@@ -112,6 +118,7 @@ class SqliteStore:
                     record.get("conversation_id"),
                     record.get("agent_id"),
                     record.get("prompt_hash"),
+                    record.get("tenant_id"),
                     json.dumps(extra, default=str) if extra else None,
                 ))
                 conn.commit()
@@ -123,7 +130,7 @@ class SqliteStore:
         "record_id", "timestamp", "provider", "model", "input_tokens",
         "output_tokens", "total_tokens", "cost_usd", "latency_ms",
         "user_id", "project_id", "status", "source",
-        "conversation_id", "agent_id", "prompt_hash",
+        "conversation_id", "agent_id", "prompt_hash", "tenant_id",
     }
 
     def get_records(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:

@@ -3,21 +3,20 @@
 import asyncio
 import logging
 import time
-import uuid
 from collections import defaultdict
-from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from .budget import BudgetEnforcer, BudgetExceededError
 from .estimator import TokenEstimator
 from .extractor import TokenExtractor
 from .pricing import PricingRegistry
-from .store import MemoryStore
+from .record import build_record
+from .store import MemoryStore, StorageBackend
 from .verifier import VerificationEngine
 
 logger = logging.getLogger(__name__)
 
-TRACKING_KWARGS = {"user_id", "project_id", "conversation_id", "agent_id", "prompt_hash"}
+TRACKING_KWARGS = {"user_id", "project_id", "conversation_id", "agent_id", "prompt_hash", "tenant_id"}
 
 
 class CircuitBreakerOpenError(Exception):
@@ -109,6 +108,7 @@ class InterceptionLayer:
         rate_limit_rps: int = 100,
         on_budget_exceeded: Optional[Callable] = None,
         on_record: Optional[Callable] = None,
+        ghost_mode: bool = False,
     ):
         self.ledger = ledger
         self.store = store
@@ -127,6 +127,7 @@ class InterceptionLayer:
         self.on_budget_exceeded = on_budget_exceeded
         self.on_record = on_record
         self.on_budget_threshold: Optional[Callable] = None
+        self.ghost_mode = ghost_mode
         self._original_methods: Dict[int, Dict[str, Callable]] = {}
         self._circuit_state: Dict[str, Dict] = {}
         self._rate_buckets: Dict[str, TokenBucket] = {}
@@ -310,6 +311,7 @@ class InterceptionLayer:
             "conversation_id": kwargs.get("conversation_id"),
             "agent_id": kwargs.get("agent_id"),
             "prompt_hash": kwargs.get("prompt_hash"),
+            "tenant_id": kwargs.get("tenant_id"),
         }
 
     def _budget_check(self, metadata: Dict[str, Any], provider: str, kwargs: Dict[str, Any]) -> None:
@@ -323,6 +325,8 @@ class InterceptionLayer:
                 max_tokens=kwargs.get("max_tokens"),
             )
         except BudgetExceededError as e:
+            if self.ghost_mode:
+                return
             self._log_blocked_attempt(metadata, provider)
             if self.on_budget_exceeded:
                 self.on_budget_exceeded(e)
@@ -334,30 +338,17 @@ class InterceptionLayer:
             token_data = self.estimator.estimate(
                 messages=messages, model=metadata["model"], provider=provider,
             )
-        cost = self.pricing.calculate_cost(
-            provider, metadata["model"], token_data["input_tokens"], token_data["output_tokens"],
+        record = build_record(
+            provider=provider, model=metadata["model"],
+            input_tokens=token_data["input_tokens"], output_tokens=token_data["output_tokens"],
+            user_id=metadata["user_id"], project_id=metadata["project_id"],
+            latency_ms=round(latency_ms, 3), source=token_data.get("source", "api_reported"),
+            pricing=self.pricing, status="success",
+            tenant_id=metadata.get("tenant_id"),
+            conversation_id=metadata.get("conversation_id"),
+            agent_id=metadata.get("agent_id"),
+            prompt_hash=metadata.get("prompt_hash"),
         )
-        record = {
-            "record_id": str(uuid.uuid4()),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "provider": provider,
-            "model": metadata["model"],
-            "input_tokens": token_data["input_tokens"],
-            "output_tokens": token_data["output_tokens"],
-            "total_tokens": token_data.get("total_tokens", token_data["input_tokens"] + token_data["output_tokens"]),
-            "cost_usd": cost,
-            "latency_ms": round(latency_ms, 3),
-            "user_id": metadata["user_id"],
-            "project_id": metadata["project_id"],
-            "status": "success",
-            "source": token_data.get("source", "api_reported"),
-        }
-        if metadata.get("conversation_id"):
-            record["conversation_id"] = metadata["conversation_id"]
-        if metadata.get("agent_id"):
-            record["agent_id"] = metadata["agent_id"]
-        if metadata.get("prompt_hash"):
-            record["prompt_hash"] = metadata["prompt_hash"]
         if not self.pricing.has_model(provider, metadata["model"]):
             if self.unknown_model_policy == "block":
                 raise UnknownModelError(f"Unknown model: {provider}:{metadata['model']}")
@@ -366,6 +357,8 @@ class InterceptionLayer:
         sysmon = getattr(self.ledger, "system_monitor", None)
         if sysmon:
             record["system"] = sysmon.snapshot()
+        if self.ghost_mode:
+            record["_ghost"] = True
         record = self.verifier.verify(record, response)
         self.store.insert_record(record)
         self.enforcer.update_model_stats(metadata["model"], token_data["input_tokens"], token_data["output_tokens"])
@@ -395,28 +388,18 @@ class InterceptionLayer:
         return wrapped
 
     def _record_usage_from_stream(self, provider: str, metadata: Dict[str, Any], token_data: Dict[str, Any]) -> None:
-        cost = self.pricing.calculate_cost(provider, metadata["model"], token_data["input_tokens"], token_data["output_tokens"])
-        record = {
-            "record_id": str(uuid.uuid4()),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "provider": provider,
-            "model": metadata["model"],
-            "input_tokens": token_data["input_tokens"],
-            "output_tokens": token_data["output_tokens"],
-            "total_tokens": token_data.get("total_tokens", token_data["input_tokens"] + token_data["output_tokens"]),
-            "cost_usd": cost,
-            "latency_ms": 0.0,
-            "user_id": metadata["user_id"],
-            "project_id": metadata["project_id"],
-            "status": "success",
-            "source": "stream",
-        }
-        if metadata.get("conversation_id"):
-            record["conversation_id"] = metadata["conversation_id"]
-        if metadata.get("agent_id"):
-            record["agent_id"] = metadata["agent_id"]
-        if metadata.get("prompt_hash"):
-            record["prompt_hash"] = metadata["prompt_hash"]
+        record = build_record(
+            provider=provider, model=metadata["model"],
+            input_tokens=token_data["input_tokens"], output_tokens=token_data["output_tokens"],
+            user_id=metadata["user_id"], project_id=metadata["project_id"],
+            source="stream", pricing=self.pricing, status="success",
+            tenant_id=metadata.get("tenant_id"),
+            conversation_id=metadata.get("conversation_id"),
+            agent_id=metadata.get("agent_id"),
+            prompt_hash=metadata.get("prompt_hash"),
+        )
+        if self.ghost_mode:
+            record["_ghost"] = True
         self.store.insert_record(record)
         self.enforcer.update_model_stats(metadata["model"], token_data["input_tokens"], token_data["output_tokens"])
 
@@ -463,21 +446,14 @@ class InterceptionLayer:
         return response
 
     def _log_blocked_attempt(self, metadata: Dict[str, Any], provider: str) -> None:
-        record = {
-            "record_id": str(uuid.uuid4()),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "provider": provider,
-            "model": metadata.get("model", "unknown"),
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-            "cost_usd": 0.0,
-            "latency_ms": 0.0,
-            "user_id": metadata.get("user_id", "anonymous"),
-            "project_id": metadata.get("project_id", "default"),
-            "status": "blocked",
-            "source": "budget_blocked",
-        }
+        record = build_record(
+            provider=provider, model=metadata.get("model", "unknown"),
+            input_tokens=0, output_tokens=0,
+            user_id=metadata.get("user_id", "anonymous"),
+            project_id=metadata.get("project_id", "default"),
+            source="budget_blocked", status="blocked",
+            tenant_id=metadata.get("tenant_id"),
+        )
         self.store.insert_record(record)
 
 
