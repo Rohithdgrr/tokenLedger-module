@@ -5,7 +5,16 @@ nav:
   - Home: index.md
   - Getting Started: getting-started.md
   - API Reference: api.md
+  - Advanced Usage: advanced.md
   - Extensions: extensions.md
-  - CLI: cli.md
+  - Differentiating Features: differentiators.md
+  - Examples:
+    - FastAPI Integration: examples/fastapi.md
   - CHANGELOG: changelog.md
-theme: readthedocs
+theme:
+  name: readthedocs
+  highlightjs: true
+markdown_extensions:
+  - admonition
+  - codehilite
+  - tables

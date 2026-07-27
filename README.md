@@ -474,6 +474,7 @@ TokenLedger is released under the **MIT License**.
 
 ## Support
 
+- **Documentation**: See `docs/` for the full MkDocs site.
 - **Issues**: [GitHub Issues](https://github.com/Rohithdgrr/tokenLedger-module/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/Rohithdgrr/tokenLedger-module/discussions)
 
