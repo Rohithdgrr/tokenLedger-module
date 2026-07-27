@@ -5,7 +5,7 @@ Usage:
     instrument_ledger(ledger, tracer=my_tracer)
 """
 
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Optional
 
 try:
     from opentelemetry import trace
@@ -48,7 +48,7 @@ def instrument_ledger(
     interceptor = ledger.interceptor
     original_on_record = interceptor.on_record
 
-    def _on_record(record: Dict[str, Any]) -> None:
+    def _on_record(record: dict[str, Any]) -> None:
         with tracer.start_as_current_span(
             f"{span_prefix}.record",
             kind=SpanKind.INTERNAL if SpanKind else None,

@@ -2,7 +2,7 @@
 
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 from .pricing import PricingRegistry
 
@@ -26,10 +26,10 @@ def build_record(
     reasoning_tokens: int = 0,
     cached_input_tokens: int = 0,
     embedding_tokens: int = 0,
-    tool_calls: Optional[List[Dict[str, Any]]] = None,
+    tool_calls: Optional[list[dict[str, Any]]] = None,
     media_type: Optional[str] = None,
     cache_hit: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Shared record-building logic used by both record_usage and interceptor."""
     if input_tokens < 0 or output_tokens < 0:
         raise ValueError("Token counts cannot be negative")
@@ -39,7 +39,7 @@ def build_record(
         cost_usd = pricing.calculate_cost(provider, model, input_tokens, output_tokens)
     cost_usd = cost_usd or 0.0
 
-    record: Dict[str, Any] = {
+    record: dict[str, Any] = {
         "record_id": str(uuid.uuid4()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "provider": provider,

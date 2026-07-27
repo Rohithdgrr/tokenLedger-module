@@ -5,8 +5,7 @@ Loads from external JSON file with fallback to builtin data.
 
 import json
 import os
-from typing import Dict, Optional
-
+from typing import Optional
 
 _BUILTIN = {
     "openai": {
@@ -97,7 +96,7 @@ def _find_pricing_file() -> Optional[str]:
 
 class PricingRegistry:
     def __init__(self, pricing_file: Optional[str] = None):
-        self._registry: Dict[str, Dict[str, float]] = {}
+        self._registry: dict[str, dict[str, float]] = {}
         self._load_builtin_pricing()
         if pricing_file or (pricing_file is None and _find_pricing_file()):
             path = pricing_file or _find_pricing_file()
@@ -132,7 +131,7 @@ class PricingRegistry:
             import logging
             logging.getLogger(__name__).warning("Failed to load pricing file %s: %s", path, e)
 
-    def get_pricing(self, provider: str, model: str) -> Dict[str, float]:
+    def get_pricing(self, provider: str, model: str) -> dict[str, float]:
         key = f"{provider}:{model}"
         entry = self._registry.get(key)
         if entry is not None:
@@ -159,7 +158,7 @@ class PricingRegistry:
     def has_model(self, provider: str, model: str) -> bool:
         return f"{provider}:{model}" in self._registry
 
-    def list_models(self, provider: Optional[str] = None) -> Dict[str, Dict[str, float]]:
+    def list_models(self, provider: Optional[str] = None) -> dict[str, dict[str, float]]:
         if provider:
             return {k: v for k, v in self._registry.items() if k.startswith(f"{provider}:")}
         return dict(self._registry)

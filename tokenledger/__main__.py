@@ -3,8 +3,6 @@
 import argparse
 import json
 import sys
-import os
-from datetime import datetime, timezone
 
 
 def _build_ledger(args):
@@ -87,7 +85,7 @@ def cmd_update_pricing(args):
 def cmd_health(args):
     ledger = _build_ledger(args)
     records = ledger.get_records()
-    print(f"Status:       OK")
+    print("Status:       OK")
     print(f"Records:      {len(records)}")
     print(f"Persist path: {args.file or '(none — in-memory only)'}")
     tampered = ledger.verify_immutability()

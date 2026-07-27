@@ -9,7 +9,7 @@ import os
 import threading
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -18,27 +18,27 @@ class StorageBackend(abc.ABC):
     """Abstract storage backend that all stores must implement."""
 
     @abc.abstractmethod
-    def insert_record(self, record: Dict[str, Any]) -> None:
+    def insert_record(self, record: dict[str, Any]) -> None:
         ...
 
     @abc.abstractmethod
-    def get_records(self) -> List[Dict[str, Any]]:
+    def get_records(self) -> list[dict[str, Any]]:
         ...
 
     @abc.abstractmethod
-    def get_running_totals(self, scope: str, scope_id: str) -> Dict[str, Any]:
+    def get_running_totals(self, scope: str, scope_id: str) -> dict[str, Any]:
         ...
 
     @abc.abstractmethod
-    def set_budget(self, scope: str, scope_id: str, budget_config: Dict[str, Any]) -> None:
+    def set_budget(self, scope: str, scope_id: str, budget_config: dict[str, Any]) -> None:
         ...
 
     @abc.abstractmethod
-    def get_budget(self, scope: str, scope_id: str) -> Optional[Dict[str, Any]]:
+    def get_budget(self, scope: str, scope_id: str) -> Optional[dict[str, Any]]:
         ...
 
     @abc.abstractmethod
-    def get_all_budgets(self) -> Dict[str, Dict[str, Any]]:
+    def get_all_budgets(self) -> dict[str, dict[str, Any]]:
         ...
 
     @abc.abstractmethod
@@ -46,7 +46,7 @@ class StorageBackend(abc.ABC):
         ...
 
     @abc.abstractmethod
-    def compact(self) -> Dict[str, Any]:
+    def compact(self) -> dict[str, Any]:
         ...
 
     @abc.abstractmethod
@@ -54,7 +54,7 @@ class StorageBackend(abc.ABC):
         ...
 
     @abc.abstractmethod
-    def verify_immutability(self) -> List[str]:
+    def verify_immutability(self) -> list[str]:
         ...
 
 
@@ -65,7 +65,7 @@ class RetentionPolicy:
         self.archive_on_trim = archive_on_trim
 
 
-def _checksum(record: Dict[str, Any]) -> str:
+def _checksum(record: dict[str, Any]) -> str:
     raw = json.dumps(record, sort_keys=True, default=str).encode()
     return hashlib.sha256(raw).hexdigest()
 
@@ -80,9 +80,9 @@ class MemoryStore(StorageBackend):
 
     def __init__(self, persist_path: Optional[str] = None, max_records: int = 100_000,
                  retention_days: int = 90, encryption_key: Optional[bytes] = None):
-        self.records: Deque[Dict[str, Any]] = deque(maxlen=max_records)
-        self.budgets: Dict[str, Dict[str, Any]] = {}
-        self.running_totals: Dict[str, Dict[str, Any]] = {}
+        self.records: deque[dict[str, Any]] = deque(maxlen=max_records)
+        self.budgets: dict[str, dict[str, Any]] = {}
+        self.running_totals: dict[str, dict[str, Any]] = {}
         self.lock = threading.RLock()
         self.persist_path = persist_path
         self.encryption_key = encryption_key
@@ -90,7 +90,7 @@ class MemoryStore(StorageBackend):
         if persist_path and os.path.exists(persist_path):
             self._load_from_disk()
 
-    def insert_record(self, record: Dict[str, Any]) -> None:
+    def insert_record(self, record: dict[str, Any]) -> None:
         with self.lock:
             record["_checksum"] = _checksum(record)
             self.records.append(record)
@@ -99,7 +99,7 @@ class MemoryStore(StorageBackend):
             if self.persist_path:
                 self._append_to_disk(record)
 
-    def _update_running_totals(self, record: Dict[str, Any]) -> None:
+    def _update_running_totals(self, record: dict[str, Any]) -> None:
         dimensions = [
             ("global", "all"),
             ("provider", record.get("provider", "unknown")),
@@ -124,18 +124,18 @@ class MemoryStore(StorageBackend):
             agg["total_tokens"] += record.get("total_tokens", 0)
             agg["cost_usd"] += record.get("cost_usd", 0.0)
 
-    def _append_to_disk(self, record: Dict[str, Any]) -> None:
+    def _append_to_disk(self, record: dict[str, Any]) -> None:
         try:
             line = json.dumps(record, default=str)
             checksum = hashlib.sha256(line.encode()).hexdigest()
-            payload = f"{checksum}:{line}\n".encode("utf-8")
+            payload = f"{checksum}:{line}\n".encode()
             if self.encryption_key:
                 payload = _encrypt(payload, self.encryption_key)
             with open(self.persist_path, "ab") as f:
                 f.write(payload)
                 f.flush()
                 os.fsync(f.fileno())
-        except (IOError, OSError) as e:
+        except OSError as e:
             logger.warning("Failed to persist record: %s", e)
 
     def _load_from_disk(self) -> None:
@@ -168,28 +168,28 @@ class MemoryStore(StorageBackend):
                         self._update_running_totals(record)
                 except (json.JSONDecodeError, ValueError):
                     continue
-        except (IOError, OSError):
+        except OSError:
             pass
 
-    def get_records(self) -> List[Dict[str, Any]]:
+    def get_records(self) -> list[dict[str, Any]]:
         with self.lock:
             return list(self.records)
 
-    def get_running_totals(self, scope: str, scope_id: str) -> Dict[str, Any]:
+    def get_running_totals(self, scope: str, scope_id: str) -> dict[str, Any]:
         key = f"{scope}:{scope_id}"
         with self.lock:
             return dict(self.running_totals.get(key, {"requests": 0, "input_tokens": 0, "output_tokens": 0,
                                                         "total_tokens": 0, "cost_usd": 0.0}))
 
-    def set_budget(self, scope: str, scope_id: str, budget_config: Dict[str, Any]) -> None:
+    def set_budget(self, scope: str, scope_id: str, budget_config: dict[str, Any]) -> None:
         with self.lock:
             self.budgets[f"{scope}:{scope_id}"] = budget_config
 
-    def get_budget(self, scope: str, scope_id: str) -> Optional[Dict[str, Any]]:
+    def get_budget(self, scope: str, scope_id: str) -> Optional[dict[str, Any]]:
         with self.lock:
             return self.budgets.get(f"{scope}:{scope_id}")
 
-    def get_all_budgets(self) -> Dict[str, Dict[str, Any]]:
+    def get_all_budgets(self) -> dict[str, dict[str, Any]]:
         with self.lock:
             return dict(self.budgets)
 
@@ -205,7 +205,7 @@ class MemoryStore(StorageBackend):
         cutoff = (datetime.now(timezone.utc) - timedelta(days=self.retention.max_age_days)).isoformat()
         pruned = [r for r in self.records if r.get("timestamp", "") > cutoff]
         if len(pruned) < len(self.records):
-            removed_count = len(self.records) - len(pruned)
+            len(self.records) - len(pruned)
             self.records = deque(pruned, maxlen=self.retention.max_records)
             self.running_totals.clear()
             for r in self.records:
@@ -221,10 +221,10 @@ class MemoryStore(StorageBackend):
                 os.replace(self.persist_path, backup)
             for r in self.records:
                 self._append_to_disk(r)
-        except (IOError, OSError) as e:
+        except OSError as e:
             logger.warning("Failed to rewrite disk after retention: %s", e)
 
-    def compact(self) -> Dict[str, Any]:
+    def compact(self) -> dict[str, Any]:
         with self.lock:
             before = len(self.records)
             self._apply_retention()
@@ -235,7 +235,7 @@ class MemoryStore(StorageBackend):
         with self.lock:
             return len(self.records)
 
-    def verify_immutability(self) -> List[str]:
+    def verify_immutability(self) -> list[str]:
         tampered = []
         for r in self.get_records():
             expected = r.get("_checksum", "")
@@ -246,14 +246,14 @@ class MemoryStore(StorageBackend):
                 tampered.append(r.get("record_id", "unknown"))
         return tampered
 
-    async def async_insert_record(self, record: Dict[str, Any]) -> None:
+    async def async_insert_record(self, record: dict[str, Any]) -> None:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self.insert_record, record)
 
-    async def async_get_records(self) -> List[Dict[str, Any]]:
+    async def async_get_records(self) -> list[dict[str, Any]]:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.get_records)
 
-    async def async_compact(self) -> Dict[str, Any]:
+    async def async_compact(self) -> dict[str, Any]:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.compact)

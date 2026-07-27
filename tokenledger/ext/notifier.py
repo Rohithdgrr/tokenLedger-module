@@ -2,9 +2,9 @@
 
 import json
 import logging
-from typing import Any, Callable, Dict, Optional
-from urllib.request import Request, urlopen
+from typing import Any, Optional
 from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,7 @@ class WebhookNotifier:
         logger.warning(msg)
         self._post({"event": "budget_exceeded", "message": str(error)})
 
-    def on_record(self, record: Dict[str, Any]) -> None:
+    def on_record(self, record: dict[str, Any]) -> None:
         cost = record.get("cost_usd", 0)
         if cost > 0:
             self._post({

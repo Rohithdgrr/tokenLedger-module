@@ -3,9 +3,8 @@
 import csv
 import hashlib
 import json
-import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from ..core.store import StorageBackend
 
@@ -16,7 +15,7 @@ class ExportEngine:
     def __init__(self, store: StorageBackend):
         self.store = store
 
-    def export_csv(self, filepath: str, records: List[Dict[str, Any]]) -> None:
+    def export_csv(self, filepath: str, records: list[dict[str, Any]]) -> None:
         keys = self._ordered_keys(records[0]) if records else ["record_id", "timestamp", "provider", "model",
                  "input_tokens", "output_tokens", "total_tokens", "cost_usd",
                  "latency_ms", "user_id", "project_id", "status", "source"]
@@ -25,11 +24,11 @@ class ExportEngine:
             writer.writeheader()
             writer.writerows(records)
 
-    def export_json(self, filepath: str, records: List[Dict[str, Any]]) -> None:
+    def export_json(self, filepath: str, records: list[dict[str, Any]]) -> None:
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(records, f, indent=2, default=str)
 
-    def export_audit_json(self, filepath: str, records: List[Dict[str, Any]]) -> None:
+    def export_audit_json(self, filepath: str, records: list[dict[str, Any]]) -> None:
         """Export with verification checksums for audit trail."""
         audit = {
             "exported_at": datetime.now(timezone.utc).isoformat(),
@@ -41,7 +40,7 @@ class ExportEngine:
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(audit, f, indent=2, default=str)
 
-    def _ordered_keys(self, record: Dict[str, Any]) -> List[str]:
+    def _ordered_keys(self, record: dict[str, Any]) -> list[str]:
         priority = ["record_id", "timestamp", "provider", "model", "input_tokens",
                      "output_tokens", "total_tokens", "cost_usd", "latency_ms",
                      "user_id", "project_id", "status", "source"]

@@ -5,10 +5,10 @@ Pre-flight spending control with multiple scope levels.
 
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
-from .store import MemoryStore
 from .pricing import PricingRegistry
+from .store import MemoryStore
 
 
 class BudgetExceededError(Exception):
@@ -39,7 +39,7 @@ class BudgetEnforcer:
     def __init__(self, store: MemoryStore, pricing: PricingRegistry):
         self.store = store
         self.pricing = pricing
-        self._avg_output_per_model: Dict[str, float] = defaultdict(lambda: 0.5)
+        self._avg_output_per_model: dict[str, float] = defaultdict(lambda: 0.5)
 
     def check_budget(
         self,
@@ -47,7 +47,7 @@ class BudgetEnforcer:
         project_id: str,
         provider: str,
         model: str,
-        messages: Optional[List[Dict[str, str]]] = None,
+        messages: Optional[list[dict[str, str]]] = None,
         input_tokens: int = 0,
         output_tokens: int = 0,
         max_tokens: Optional[int] = None,
@@ -74,7 +74,7 @@ class BudgetEnforcer:
 
         return True
 
-    def _get_applicable_budgets(self, user_id: str, project_id: str) -> List[tuple]:
+    def _get_applicable_budgets(self, user_id: str, project_id: str) -> list[tuple]:
         """Find all budget rules that apply to this request."""
         budgets = []
         scope_keys = [
@@ -89,7 +89,7 @@ class BudgetEnforcer:
                 budgets.append((f"{scope}:{scope_id}", budget))
         return budgets
 
-    def _calculate_current_spend(self, budget: Dict[str, Any]) -> float:
+    def _calculate_current_spend(self, budget: dict[str, Any]) -> float:
         """Calculate current spend using running totals (O(1))."""
         scope = budget.get("scope", "global")
         scope_id = budget.get("scope_id", "")
@@ -134,7 +134,7 @@ class BudgetEnforcer:
             start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         return start.isoformat()
 
-    def _record_matches_budget(self, record: Dict[str, Any], budget: Dict[str, Any]) -> bool:
+    def _record_matches_budget(self, record: dict[str, Any], budget: dict[str, Any]) -> bool:
         """Check if a historical record falls under a budget's scope."""
         scope = budget.get("scope", "global")
         scope_id = budget.get("scope_id", "")
@@ -154,7 +154,7 @@ class BudgetEnforcer:
         self,
         provider: str,
         model: str,
-        messages: Optional[List[Dict[str, str]]] = None,
+        messages: Optional[list[dict[str, str]]] = None,
         input_tokens: int = 0,
         output_tokens: int = 0,
         max_tokens: Optional[int] = None,

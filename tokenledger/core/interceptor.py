@@ -3,15 +3,14 @@
 import asyncio
 import logging
 import time
-from collections import defaultdict
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Optional
 
 from .budget import BudgetEnforcer, BudgetExceededError
 from .estimator import TokenEstimator
 from .extractor import TokenExtractor
 from .pricing import PricingRegistry
 from .record import build_record
-from .store import MemoryStore, StorageBackend
+from .store import MemoryStore
 from .verifier import VerificationEngine
 
 logger = logging.getLogger(__name__)
@@ -57,7 +56,7 @@ class StreamWrapper:
     def __init__(self, stream, provider: str):
         self._stream = stream
         self._provider = provider
-        self._chunks: List[Any] = []
+        self._chunks: list[Any] = []
 
     def __iter__(self):
         for chunk in self._stream:
@@ -72,7 +71,7 @@ class StreamWrapper:
             self._chunks.append(chunk)
             yield chunk
 
-    def get_accumulated_usage(self) -> Optional[Dict[str, Any]]:
+    def get_accumulated_usage(self) -> Optional[dict[str, Any]]:
         for chunk in reversed(self._chunks):
             usage = getattr(chunk, "usage", None)
             if usage:
@@ -128,19 +127,19 @@ class InterceptionLayer:
         self.on_record = on_record
         self.on_budget_threshold: Optional[Callable] = None
         self.ghost_mode = ghost_mode
-        self._original_methods: Dict[int, Dict[str, Callable]] = {}
-        self._circuit_state: Dict[str, Dict] = {}
-        self._rate_buckets: Dict[str, TokenBucket] = {}
-        self._provider_config: Dict[str, Dict[str, Any]] = {}
+        self._original_methods: dict[int, dict[str, Callable]] = {}
+        self._circuit_state: dict[str, dict] = {}
+        self._rate_buckets: dict[str, TokenBucket] = {}
+        self._provider_config: dict[str, dict[str, Any]] = {}
 
     def configure_provider(self, provider: str, **kwargs) -> None:
         """Per-provider override for retries, timeout, rate limit, etc."""
         self._provider_config.setdefault(provider, {}).update(kwargs)
 
-    def _get_provider_config(self, provider: str) -> Dict[str, Any]:
+    def _get_provider_config(self, provider: str) -> dict[str, Any]:
         return self._provider_config.get(provider, {})
 
-    def _strip_tracking_kwargs(self, kwargs: Dict[str, Any]) -> None:
+    def _strip_tracking_kwargs(self, kwargs: dict[str, Any]) -> None:
         for key in TRACKING_KWARGS:
             kwargs.pop(key, None)
 
@@ -205,7 +204,7 @@ class InterceptionLayer:
             setattr(parent, parts[-1], original)
         return client
 
-    def get_health(self) -> Dict[str, Any]:
+    def get_health(self) -> dict[str, Any]:
         """Return circuit breaker and rate limiter status per provider."""
         now = time.monotonic()
         result = {}
@@ -213,7 +212,7 @@ class InterceptionLayer:
         for provider in sorted(all_providers):
             cb = self._circuit_state.get(provider, {"state": "closed", "failures": 0, "since": 0.0})
             bucket = self._rate_buckets.get(provider)
-            entry: Dict[str, Any] = {
+            entry: dict[str, Any] = {
                 "circuit_state": cb["state"],
                 "circuit_failures": cb["failures"],
             }
@@ -255,7 +254,8 @@ class InterceptionLayer:
             self._rate_buckets[provider] = bucket
         bucket.consume()
 
-    def _call_with_retry(self, original: Callable, args: tuple, kwargs: Dict[str, Any], provider: str, timeout: Optional[float] = None) -> Any:
+    def _call_with_retry(self, original: Callable, args: tuple, kwargs: dict[str, Any],
+                     provider: str, timeout: Optional[float] = None) -> Any:
         self._strip_tracking_kwargs(kwargs)
         cfg = self._get_provider_config(provider)
         max_retries = cfg.get("max_retries", self.max_retries)
@@ -278,7 +278,8 @@ class InterceptionLayer:
             except Exception:
                 raise
 
-    async def _call_with_retry_async(self, original: Callable, args: tuple, kwargs: Dict[str, Any], provider: str, timeout: Optional[float] = None) -> Any:
+    async def _call_with_retry_async(self, original: Callable, args: tuple, kwargs: dict[str, Any],
+                                      provider: str, timeout: Optional[float] = None) -> Any:
         self._strip_tracking_kwargs(kwargs)
         cfg = self._get_provider_config(provider)
         max_retries = cfg.get("max_retries", self.max_retries)
@@ -303,7 +304,7 @@ class InterceptionLayer:
             except Exception:
                 raise
 
-    def _extract_meta(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    def _extract_meta(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         return {
             "user_id": kwargs.get("user_id", "anonymous"),
             "project_id": kwargs.get("project_id", "default"),
@@ -314,7 +315,7 @@ class InterceptionLayer:
             "tenant_id": kwargs.get("tenant_id"),
         }
 
-    def _budget_check(self, metadata: Dict[str, Any], provider: str, kwargs: Dict[str, Any]) -> None:
+    def _budget_check(self, metadata: dict[str, Any], provider: str, kwargs: dict[str, Any]) -> None:
         try:
             self.enforcer.check_budget(
                 user_id=metadata["user_id"],
@@ -332,7 +333,7 @@ class InterceptionLayer:
                 self.on_budget_exceeded(e)
             raise
 
-    def _record(self, provider: str, metadata: Dict[str, Any], messages: list, response: Any, latency_ms: float) -> None:
+    def _record(self, provider: str, metadata: dict[str, Any], messages: list, response: Any, latency_ms: float) -> None:
         token_data = self.extractor.extract(response, provider)
         if token_data is None:
             token_data = self.estimator.estimate(
@@ -365,7 +366,7 @@ class InterceptionLayer:
         if self.on_record:
             self.on_record(record)
 
-    def _handle_stream(self, response: Any, provider: str, metadata: Dict[str, Any]) -> Any:
+    def _handle_stream(self, response: Any, provider: str, metadata: dict[str, Any]) -> Any:
         wrapped = StreamWrapper(response, provider)
         original_iter = wrapped.__iter__
         original_aiter = wrapped.__aiter__
@@ -387,7 +388,7 @@ class InterceptionLayer:
         wrapped.__aiter__ = tracked_aiter
         return wrapped
 
-    def _record_usage_from_stream(self, provider: str, metadata: Dict[str, Any], token_data: Dict[str, Any]) -> None:
+    def _record_usage_from_stream(self, provider: str, metadata: dict[str, Any], token_data: dict[str, Any]) -> None:
         record = build_record(
             provider=provider, model=metadata["model"],
             input_tokens=token_data["input_tokens"], output_tokens=token_data["output_tokens"],
@@ -403,7 +404,7 @@ class InterceptionLayer:
         self.store.insert_record(record)
         self.enforcer.update_model_stats(metadata["model"], token_data["input_tokens"], token_data["output_tokens"])
 
-    def _track_request(self, original: Callable, provider: str, args: tuple, kwargs: Dict[str, Any]) -> Any:
+    def _track_request(self, original: Callable, provider: str, args: tuple, kwargs: dict[str, Any]) -> Any:
         metadata = self._extract_meta(kwargs)
         self._budget_check(metadata, provider, kwargs)
         self._check_circuit(provider)
@@ -424,7 +425,7 @@ class InterceptionLayer:
         self._record(provider, metadata, kwargs.get("messages", []), response, latency_ms)
         return response
 
-    async def _track_request_async(self, original: Callable, provider: str, args: tuple, kwargs: Dict[str, Any]) -> Any:
+    async def _track_request_async(self, original: Callable, provider: str, args: tuple, kwargs: dict[str, Any]) -> Any:
         metadata = self._extract_meta(kwargs)
         self._budget_check(metadata, provider, kwargs)
         self._check_circuit(provider)
@@ -445,7 +446,7 @@ class InterceptionLayer:
         self._record(provider, metadata, kwargs.get("messages", []), response, latency_ms)
         return response
 
-    def _log_blocked_attempt(self, metadata: Dict[str, Any], provider: str) -> None:
+    def _log_blocked_attempt(self, metadata: dict[str, Any], provider: str) -> None:
         record = build_record(
             provider=provider, model=metadata.get("model", "unknown"),
             input_tokens=0, output_tokens=0,

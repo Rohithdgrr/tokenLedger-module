@@ -2,10 +2,10 @@
 
 import threading
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 
-def _cpu() -> Dict[str, Any]:
+def _cpu() -> dict[str, Any]:
     try:
         import psutil
         return {
@@ -17,7 +17,7 @@ def _cpu() -> Dict[str, Any]:
         return {"percent": 0, "count": 0, "freq": 0}
 
 
-def _ram() -> Dict[str, Any]:
+def _ram() -> dict[str, Any]:
     try:
         import psutil
         m = psutil.virtual_memory()
@@ -26,7 +26,7 @@ def _ram() -> Dict[str, Any]:
         return {"total": 0, "available": 0, "percent": 0, "used": 0}
 
 
-def _disk() -> Dict[str, Any]:
+def _disk() -> dict[str, Any]:
     try:
         import psutil
         result = {}
@@ -44,20 +44,21 @@ def _disk() -> Dict[str, Any]:
         return {}
 
 
-def _storage() -> Dict[str, Any]:
+def _storage() -> dict[str, Any]:
     return _disk()
 
 
-def _network() -> Dict[str, Any]:
+def _network() -> dict[str, Any]:
     try:
         import psutil
         n = psutil.net_io_counters()
-        return {"bytes_sent": n.bytes_sent, "bytes_recv": n.bytes_recv, "packets_sent": n.packets_sent, "packets_recv": n.packets_recv}
+        return {"bytes_sent": n.bytes_sent, "bytes_recv": n.bytes_recv, "packets_sent": n.packets_sent,
+                "packets_recv": n.packets_recv}
     except ImportError:
         return {"bytes_sent": 0, "bytes_recv": 0, "packets_sent": 0, "packets_recv": 0}
 
 
-def _internet(timeout: float = 2.0) -> Dict[str, Any]:
+def _internet(timeout: float = 2.0) -> dict[str, Any]:
     hosts = ["8.8.8.8", "1.1.1.1", "208.67.222.222"]
     for host in hosts:
         try:
@@ -72,20 +73,23 @@ def _internet(timeout: float = 2.0) -> Dict[str, Any]:
     return {"reachable": False, "latency_ms": 0.0, "host": ""}
 
 
-def _temperature() -> Dict[str, Any]:
+def _temperature() -> dict[str, Any]:
     try:
         import psutil
         temps = psutil.sensors_temperatures()
         if temps:
             result = {}
             for name, entries in temps.items():
-                result[name] = [{"label": e.label or name, "current": e.current, "high": e.high, "critical": e.critical} for e in entries]
+                result[name] = [{"label": e.label or name, "current": e.current, "high": e.high,
+                                  "critical": e.critical} for e in entries]
             return result
     except (ImportError, AttributeError):
         pass
     try:
         import subprocess
-        out = subprocess.check_output("wmic /namespace:\\\\root\\wmi PATH MSAcpi_ThermalZoneTemperature get CurrentTemperature /value", shell=True, timeout=5)
+        out = subprocess.check_output(
+            "wmic /namespace:\\\\root\\wmi PATH MSAcpi_ThermalZoneTemperature get CurrentTemperature /value",
+            shell=True, timeout=5)
         val = out.decode().strip()
         if "CurrentTemperature" in val:
             temp_k = float(val.split("=")[1].strip())
@@ -95,7 +99,7 @@ def _temperature() -> Dict[str, Any]:
     return {}
 
 
-def _gpu() -> Dict[str, Any]:
+def _gpu() -> dict[str, Any]:
     try:
         import subprocess
         out = subprocess.check_output(
@@ -117,7 +121,7 @@ def _gpu() -> Dict[str, Any]:
         return {}
 
 
-def _power() -> Dict[str, Any]:
+def _power() -> dict[str, Any]:
     try:
         import psutil
         b = psutil.sensors_battery()
@@ -128,7 +132,7 @@ def _power() -> Dict[str, Any]:
     return {"percent": 0, "plugged": True, "secsleft": None}
 
 
-def _processor() -> Dict[str, Any]:
+def _processor() -> dict[str, Any]:
     import platform
     try:
         import psutil
@@ -141,7 +145,8 @@ def _processor() -> Dict[str, Any]:
             "max_freq_mhz": getattr(freq, "max", 0) if freq else 0,
         }
     except ImportError:
-        return {"architecture": platform.machine(), "name": platform.processor(), "cores_physical": 0, "cores_logical": 0, "max_freq_mhz": 0}
+        return {"architecture": platform.machine(), "name": platform.processor(),
+                "cores_physical": 0, "cores_logical": 0, "max_freq_mhz": 0}
 
 
 class SystemMonitor:
@@ -149,13 +154,13 @@ class SystemMonitor:
 
     def __init__(self, collection_interval: float = 60.0):
         self.interval = collection_interval
-        self.metrics: List[Dict[str, Any]] = []
+        self.metrics: list[dict[str, Any]] = []
         self.lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._processor_info = _processor()
 
-    def snapshot(self, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def snapshot(self, context: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         with self.lock:
             record = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -175,7 +180,7 @@ class SystemMonitor:
             self.metrics.append(record)
             return record
 
-    def get_metrics(self, start: Optional[str] = None, end: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_metrics(self, start: Optional[str] = None, end: Optional[str] = None) -> list[dict[str, Any]]:
         with self.lock:
             result = list(self.metrics)
         if start:
@@ -184,7 +189,7 @@ class SystemMonitor:
             result = [r for r in result if r.get("timestamp", "") <= end]
         return result
 
-    def get_summary(self, start: Optional[str] = None, end: Optional[str] = None) -> Dict[str, Any]:
+    def get_summary(self, start: Optional[str] = None, end: Optional[str] = None) -> dict[str, Any]:
         records = self.get_metrics(start, end)
         if not records:
             return {"count": 0}

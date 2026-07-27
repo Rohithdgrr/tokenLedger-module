@@ -3,7 +3,7 @@ Provider-specific token extraction from API responses.
 Falls back to estimation when usage data is unavailable.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 
 class TokenExtractor:
@@ -27,13 +27,13 @@ class TokenExtractor:
         "perplexity": "_parse_openai",
     }
 
-    def extract(self, response: Any, provider: str) -> Optional[Dict[str, Any]]:
+    def extract(self, response: Any, provider: str) -> Optional[dict[str, Any]]:
         """Extract token usage from a provider response."""
         parser_name = self.PROVIDER_PARSERS.get(provider, "_parse_generic")
         parser = getattr(self, parser_name, self._parse_generic)
         return parser(response)
 
-    def _parse_openai(self, response: Any) -> Optional[Dict[str, Any]]:
+    def _parse_openai(self, response: Any) -> Optional[dict[str, Any]]:
         """Parse OpenAI response usage."""
         try:
             usage = response.usage
@@ -48,7 +48,7 @@ class TokenExtractor:
         except AttributeError:
             return None
 
-    def _parse_anthropic(self, response: Any) -> Optional[Dict[str, Any]]:
+    def _parse_anthropic(self, response: Any) -> Optional[dict[str, Any]]:
         """Parse Anthropic response usage."""
         try:
             usage = response.usage
@@ -65,7 +65,7 @@ class TokenExtractor:
         except AttributeError:
             return None
 
-    def _parse_gemini(self, response: Any) -> Optional[Dict[str, Any]]:
+    def _parse_gemini(self, response: Any) -> Optional[dict[str, Any]]:
         """Parse Google Gemini response usage."""
         try:
             metadata = response.usage_metadata
@@ -80,7 +80,7 @@ class TokenExtractor:
         except AttributeError:
             return None
 
-    def _parse_groq(self, response: Any) -> Optional[Dict[str, Any]]:
+    def _parse_groq(self, response: Any) -> Optional[dict[str, Any]]:
         """Parse Groq response usage."""
         try:
             usage = response.usage
@@ -95,7 +95,7 @@ class TokenExtractor:
         except AttributeError:
             return None
 
-    def _parse_openrouter(self, response: Any) -> Optional[Dict[str, Any]]:
+    def _parse_openrouter(self, response: Any) -> Optional[dict[str, Any]]:
         """Parse OpenRouter response usage."""
         try:
             usage = response.usage
@@ -110,7 +110,7 @@ class TokenExtractor:
         except AttributeError:
             return None
 
-    def _parse_ollama(self, response: Any) -> Optional[Dict[str, Any]]:
+    def _parse_ollama(self, response: Any) -> Optional[dict[str, Any]]:
         """Parse Ollama response usage."""
         try:
             usage = getattr(response, "usage", None)
@@ -134,7 +134,7 @@ class TokenExtractor:
         except AttributeError:
             return None
 
-    def _parse_cohere(self, response: Any) -> Optional[Dict[str, Any]]:
+    def _parse_cohere(self, response: Any) -> Optional[dict[str, Any]]:
         try:
             meta = response.meta
             if meta is None:
@@ -149,7 +149,7 @@ class TokenExtractor:
         except AttributeError:
             return None
 
-    def _parse_generic(self, response: Any) -> Optional[Dict[str, Any]]:
+    def _parse_generic(self, response: Any) -> Optional[dict[str, Any]]:
         """Generic parser that tries common patterns."""
         try:
             usage = getattr(response, "usage", None)

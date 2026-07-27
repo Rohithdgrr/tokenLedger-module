@@ -3,25 +3,34 @@ name: Publish to PyPI
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "PyPI environment (test or live)"
+        required: true
+        default: "test"
+        type: choice
+        options: [test, live]
+
+permissions:
+  id-token: write
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
+    environment: ${{ inputs.environment || 'live' }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-
-      - name: Install build tools
-        run: pip install build
-
-      - name: Build package
-        run: python -m build
-
+          python-version: "3.11"
+      - run: pip install build twine
+      - run: python -m build
+      - name: Publish to Test PyPI
+        if: inputs.environment == 'test'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
       - name: Publish to PyPI
+        if: inputs.environment != 'test'
         uses: pypa/gh-action-pypi-publish@release/v1

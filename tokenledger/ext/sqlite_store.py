@@ -1,10 +1,11 @@
 """SQLite storage backend for TokenLedger — persists records to a local DB file."""
 
+import contextlib
 import json
 import sqlite3
 import threading
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 from tokenledger.core.store import StorageBackend
 
@@ -22,8 +23,8 @@ class SqliteStore(StorageBackend):
         self.db_path = db_path
         self.max_records = max_records
         self.lock = threading.RLock()
-        self.budgets: Dict[str, Dict[str, Any]] = {}
-        self.running_totals: Dict[str, Dict[str, Any]] = {}
+        self.budgets: dict[str, dict[str, Any]] = {}
+        self.running_totals: dict[str, dict[str, Any]] = {}
         self._init_db()
 
     def _init_db(self) -> None:
@@ -66,7 +67,7 @@ class SqliteStore(StorageBackend):
         for r in self.get_records():
             self._update_running_totals(r)
 
-    def _update_running_totals(self, record: Dict[str, Any]) -> None:
+    def _update_running_totals(self, record: dict[str, Any]) -> None:
         dimensions = [
             ("global", "all"),
             ("provider", record.get("provider", "unknown")),
@@ -89,7 +90,7 @@ class SqliteStore(StorageBackend):
             agg["total_tokens"] += record.get("total_tokens", 0)
             agg["cost_usd"] += record.get("cost_usd", 0.0)
 
-    def insert_record(self, record: Dict[str, Any]) -> None:
+    def insert_record(self, record: dict[str, Any]) -> None:
         with self.lock:
             extra = {k: v for k, v in record.items()
                      if k not in self._COLUMNS and k != "_checksum"}
@@ -133,7 +134,7 @@ class SqliteStore(StorageBackend):
         "conversation_id", "agent_id", "prompt_hash", "tenant_id",
     }
 
-    def get_records(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    def get_records(self, limit: Optional[int] = None) -> list[dict[str, Any]]:
         with self.lock:
             conn = sqlite3.connect(self.db_path)
             try:
@@ -147,16 +148,14 @@ class SqliteStore(StorageBackend):
                     r = dict(zip([d[0] for d in cursor.description], row))
                     extra = r.pop("extra", None)
                     if extra:
-                        try:
+                        with contextlib.suppress(json.JSONDecodeError, TypeError):
                             r.update(json.loads(extra))
-                        except (json.JSONDecodeError, TypeError):
-                            pass
                     rows.append(r)
                 return rows
             finally:
                 conn.close()
 
-    def get_running_totals(self, scope: str, scope_id: str) -> Dict[str, Any]:
+    def get_running_totals(self, scope: str, scope_id: str) -> dict[str, Any]:
         key = f"{scope}:{scope_id}"
         with self.lock:
             return dict(self.running_totals.get(key, {
@@ -164,19 +163,19 @@ class SqliteStore(StorageBackend):
                 "total_tokens": 0, "cost_usd": 0.0,
             }))
 
-    def set_budget(self, scope: str, scope_id: str, budget_config: Dict[str, Any]) -> None:
+    def set_budget(self, scope: str, scope_id: str, budget_config: dict[str, Any]) -> None:
         with self.lock:
             self.budgets[f"{scope}:{scope_id}"] = budget_config
 
-    def get_budget(self, scope: str, scope_id: str) -> Optional[Dict[str, Any]]:
+    def get_budget(self, scope: str, scope_id: str) -> Optional[dict[str, Any]]:
         with self.lock:
             return self.budgets.get(f"{scope}:{scope_id}")
 
-    def get_all_budgets(self) -> Dict[str, Dict[str, Any]]:
+    def get_all_budgets(self) -> dict[str, dict[str, Any]]:
         with self.lock:
             return dict(self.budgets)
 
-    def verify_immutability(self) -> List[str]:
+    def verify_immutability(self) -> list[str]:
         tampered = []
         for r in self.get_records():
             expected = r.get("_checksum", "")
@@ -201,7 +200,7 @@ class SqliteStore(StorageBackend):
             self.running_totals.clear()
             self.budgets.clear()
 
-    def compact(self) -> Dict[str, Any]:
+    def compact(self) -> dict[str, Any]:
         before = len(self.get_records())
         cutoff = (datetime.now(timezone.utc)).isoformat()
         with self.lock:

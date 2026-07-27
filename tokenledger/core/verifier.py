@@ -2,7 +2,7 @@
 
 import abc
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 from .pricing import PricingRegistry
 from .store import StorageBackend
@@ -12,13 +12,13 @@ class VerificationRule(abc.ABC):
     """Base class for custom verification rules."""
 
     @abc.abstractmethod
-    def check(self, record: Dict[str, Any], store: StorageBackend, pricing: PricingRegistry) -> Optional[str]:
+    def check(self, record: dict[str, Any], store: StorageBackend, pricing: PricingRegistry) -> Optional[str]:
         """Return a flag string if the record fails this rule, or None."""
         ...
 
 
 class TokenArithmeticRule(VerificationRule):
-    def check(self, record: Dict[str, Any], store: StorageBackend, pricing: PricingRegistry) -> Optional[str]:
+    def check(self, record: dict[str, Any], store: StorageBackend, pricing: PricingRegistry) -> Optional[str]:
         expected = record.get("input_tokens", 0) + record.get("output_tokens", 0)
         if record.get("total_tokens", 0) != expected:
             record["total_tokens"] = expected
@@ -27,14 +27,16 @@ class TokenArithmeticRule(VerificationRule):
 
 
 class NegativeTokenRule(VerificationRule):
-    def check(self, record: Dict[str, Any], store: StorageBackend, pricing: PricingRegistry) -> Optional[str]:
-        if record.get("input_tokens", 0) < 0 or record.get("output_tokens", 0) < 0:
-            raise ValueError(f"Impossible token count: input={record.get('input_tokens')}, output={record.get('output_tokens')}")
+    def check(self, record: dict[str, Any], store: StorageBackend, pricing: PricingRegistry) -> Optional[str]:
+        inp = record.get("input_tokens", 0)
+        out = record.get("output_tokens", 0)
+        if inp < 0 or out < 0:
+            raise ValueError(f"Impossible token count: input={inp}, output={out}")
         return None
 
 
 class CostRecalculationRule(VerificationRule):
-    def check(self, record: Dict[str, Any], store: StorageBackend, pricing: PricingRegistry) -> Optional[str]:
+    def check(self, record: dict[str, Any], store: StorageBackend, pricing: PricingRegistry) -> Optional[str]:
         expected = pricing.calculate_cost(
             record.get("provider", "unknown"), record.get("model", "unknown"),
             record.get("input_tokens", 0), record.get("output_tokens", 0),
@@ -46,15 +48,14 @@ class CostRecalculationRule(VerificationRule):
 
 
 class UnknownModelRule(VerificationRule):
-    def check(self, record: Dict[str, Any], store: StorageBackend, pricing: PricingRegistry) -> Optional[str]:
-        if not pricing.has_model(record.get("provider", ""), record.get("model", "")):
-            if record.get("provider") != "custom":
-                return "UNKNOWN_MODEL"
+    def check(self, record: dict[str, Any], store: StorageBackend, pricing: PricingRegistry) -> Optional[str]:
+        if not pricing.has_model(record.get("provider", ""), record.get("model", "")) and record.get("provider") != "custom":
+            return "UNKNOWN_MODEL"
         return None
 
 
 class NegativeLatencyRule(VerificationRule):
-    def check(self, record: Dict[str, Any], store: StorageBackend, pricing: PricingRegistry) -> Optional[str]:
+    def check(self, record: dict[str, Any], store: StorageBackend, pricing: PricingRegistry) -> Optional[str]:
         if record.get("latency_ms", 0) < 0:
             record["latency_ms"] = 0
             return "NEGATIVE_LATENCY"
@@ -65,7 +66,7 @@ class AnomalyDetectionRule(VerificationRule):
     def __init__(self, threshold: float = 3.0):
         self.threshold = threshold
 
-    def check(self, record: Dict[str, Any], store: StorageBackend, pricing: PricingRegistry) -> Optional[str]:
+    def check(self, record: dict[str, Any], store: StorageBackend, pricing: PricingRegistry) -> Optional[str]:
         user_id = record.get("user_id", "anonymous")
         user_totals = store.get_running_totals("user", user_id)
         if user_totals.get("requests", 0) < 10:
@@ -81,10 +82,10 @@ class VerificationEngine:
     """Pluggable verification pipeline with default rules."""
 
     def __init__(self, pricing_registry: PricingRegistry, store: StorageBackend,
-                 custom_rules: Optional[List[VerificationRule]] = None):
+                 custom_rules: Optional[list[VerificationRule]] = None):
         self.pricing = pricing_registry
         self.store = store
-        self.rules: List[VerificationRule] = custom_rules or [
+        self.rules: list[VerificationRule] = custom_rules or [
             TokenArithmeticRule(),
             NegativeTokenRule(),
             CostRecalculationRule(),
@@ -96,7 +97,7 @@ class VerificationEngine:
     def add_rule(self, rule: VerificationRule) -> None:
         self.rules.append(rule)
 
-    def verify(self, record: Dict[str, Any], raw_response: Any = None) -> Dict[str, Any]:
+    def verify(self, record: dict[str, Any], raw_response: Any = None) -> dict[str, Any]:
         flags = []
         for rule in self.rules:
             try:

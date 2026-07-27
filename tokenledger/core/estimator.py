@@ -3,7 +3,7 @@ Token estimation when APIs do not report usage data.
 Uses tiktoken for OpenAI models, character heuristic for others.
 """
 
-from typing import Any, Dict, List
+from typing import Any
 
 
 class TokenEstimator:
@@ -11,7 +11,7 @@ class TokenEstimator:
 
     def __init__(self):
         self._tiktoken_available = self._check_tiktoken()
-        self._encoders: Dict[str, Any] = {}
+        self._encoders: dict[str, Any] = {}
 
     def _check_tiktoken(self) -> bool:
         """Check if tiktoken is available."""
@@ -22,7 +22,7 @@ class TokenEstimator:
         except ImportError:
             return False
 
-    def estimate(self, messages: List[Dict[str, str]], model: str, provider: str) -> Dict[str, Any]:
+    def estimate(self, messages: list[dict[str, str]], model: str, provider: str) -> dict[str, Any]:
         text = " ".join([str(m.get("content", "")) for m in messages])
         return self.estimate_from_text(text, provider, model)
 
@@ -39,13 +39,13 @@ class TokenEstimator:
         except Exception:
             return self._char_heuristic(text)
 
-    def estimate_from_text(self, text: str, provider: str = "generic", model: str = "unknown") -> Dict[str, Any]:
-        input_tokens = self._estimate_with_tiktoken(text, model) if provider == "openai" and self._tiktoken_available else self._char_heuristic(text)
-        output_tokens = max(1, int(input_tokens * 0.4))  # ponytail: 40% output ratio, tune per model if needed
+    def estimate_from_text(self, text: str, provider: str = "generic", model: str = "unknown") -> dict[str, Any]:
+        inp = self._estimate_with_tiktoken(text, model) if provider == "openai" and self._tiktoken_available else self._char_heuristic(text)
+        out = max(1, int(inp * 0.4))  # ponytail: 40% output ratio, tune per model if needed
         return {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
+            "input_tokens": inp,
+            "output_tokens": out,
+            "total_tokens": inp + out,
             "source": "estimated",
             "estimation_method": "tiktoken" if provider == "openai" and self._tiktoken_available else "character_heuristic",
         }

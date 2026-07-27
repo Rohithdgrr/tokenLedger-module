@@ -4,7 +4,7 @@ Pure Python queries with O(1) lookups via running totals.
 """
 
 from collections import Counter, defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 from .store import MemoryStore
 
@@ -18,7 +18,7 @@ class AnalyticsEngine:
     def __init__(self, store: MemoryStore):
         self.store = store
 
-    def get_summary(self, scope: str = "global", scope_id: str = "all") -> Dict[str, Any]:
+    def get_summary(self, scope: str = "global", scope_id: str = "all") -> dict[str, Any]:
         """Get summary statistics with budget utilization, top models, and anomalies."""
         base = self.store.get_running_totals(scope, scope_id)
         records = self.store.get_records()
@@ -28,7 +28,7 @@ class AnalyticsEngine:
 
         budget_utilization = {}
         for bk, b in budgets.items():
-            spend_key = f"{b.get('scope','global')}:{b.get('scope_id','all')}"
+            f"{b.get('scope','global')}:{b.get('scope_id','all')}"
             spend = self.store.get_running_totals(b.get('scope','global'), b.get('scope_id','all'))
             limit = b.get("limit_usd", 0)
             budget_utilization[bk] = {
@@ -38,8 +38,8 @@ class AnalyticsEngine:
             }
         base["budget_utilization"] = budget_utilization
 
-        model_totals: Dict[str, int] = defaultdict(int)
-        provider_totals: Dict[str, int] = defaultdict(int)
+        model_totals: dict[str, int] = defaultdict(int)
+        provider_totals: dict[str, int] = defaultdict(int)
         status_counts: Counter = Counter()
         for r in records:
             model_totals[r.get("model", "unknown")] += r.get("total_tokens", 0)
@@ -59,7 +59,7 @@ class AnalyticsEngine:
 
         return base
 
-    def get_spending_by_dimension(self, dimension: str) -> List[Dict[str, Any]]:
+    def get_spending_by_dimension(self, dimension: str) -> list[dict[str, Any]]:
         """Get spending breakdown by a dimension."""
         results = []
         prefix = f"{dimension}:"
@@ -71,7 +71,7 @@ class AnalyticsEngine:
 
         return sorted(results, key=lambda x: x.get("cost_usd", 0), reverse=True)
 
-    def get_trend(self, dimension: str, dimension_id: str, granularity: str = "day") -> List[Dict[str, Any]]:
+    def get_trend(self, dimension: str, dimension_id: str, granularity: str = "day") -> list[dict[str, Any]]:
         """Get time-series trend data."""
         slice_lengths = {
             "hour": 13,
@@ -81,7 +81,7 @@ class AnalyticsEngine:
         }
 
         slice_len = slice_lengths.get(granularity, 10)
-        buckets: Dict[str, Dict[str, Any]] = {}
+        buckets: dict[str, dict[str, Any]] = {}
 
         for record in self.store.get_records():
             if not self._matches_dimension(record, dimension, dimension_id):
@@ -112,7 +112,7 @@ class AnalyticsEngine:
 
         return sorted(buckets.values(), key=lambda x: x["period"])
 
-    def get_latency_stats(self, scope: str = "global", scope_id: str = "all") -> Dict[str, Any]:
+    def get_latency_stats(self, scope: str = "global", scope_id: str = "all") -> dict[str, Any]:
         """Get latency statistics for a scope."""
         latencies = []
 
@@ -138,7 +138,7 @@ class AnalyticsEngine:
             "p99": round(latencies[int(n * 0.99)] if n * 0.99 < n else latencies[-1], 2),
         }
 
-    def get_budget_utilization(self, scope: str, scope_id: str) -> Optional[Dict[str, Any]]:
+    def get_budget_utilization(self, scope: str, scope_id: str) -> Optional[dict[str, Any]]:
         """Get current budget utilization percentage."""
         budget = self.store.get_budget(scope, scope_id)
         if not budget:
@@ -162,7 +162,7 @@ class AnalyticsEngine:
             "reset_cycle": budget.get("reset_cycle", "monthly"),
         }
 
-    def get_efficiency_stats(self, scope: str = "global", scope_id: str = "all") -> Dict[str, Any]:
+    def get_efficiency_stats(self, scope: str = "global", scope_id: str = "all") -> dict[str, Any]:
         """Token efficiency metrics (output/input ratio, cache hit rate)."""
         records = [r for r in self.store.get_records() if self._matches_dimension(r, scope, scope_id)]
         if not records:
@@ -187,7 +187,7 @@ class AnalyticsEngine:
             "total_reasoning_tokens": total_reasoning,
         }
 
-    def get_cost_breakdown(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def get_cost_breakdown(self, records: list[dict[str, Any]]) -> dict[str, Any]:
         """Breakdown of costs by category (completion, cache, embedding, etc.)."""
         total = {"completion": 0.0, "cached": 0.0, "embedding": 0.0, "tool_calls": 0.0, "media": 0.0}
         for r in records:
@@ -200,7 +200,7 @@ class AnalyticsEngine:
                 total["completion"] += cost
         return total
 
-    def _matches_dimension(self, record: Dict[str, Any], dimension: str, dimension_id: str) -> bool:
+    def _matches_dimension(self, record: dict[str, Any], dimension: str, dimension_id: str) -> bool:
         """Check if a record matches a dimension filter."""
         if dimension == "global":
             return True
@@ -218,7 +218,7 @@ class AnalyticsEngine:
             return record.get("agent_id") == dimension_id
         return False
 
-    def _matches_budget_scope(self, record: Dict[str, Any], budget: Dict[str, Any]) -> bool:
+    def _matches_budget_scope(self, record: dict[str, Any], budget: dict[str, Any]) -> bool:
         """Check if a record matches a budget's scope."""
         scope = budget.get("scope", "global")
         scope_id = budget.get("scope_id", "")
