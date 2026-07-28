@@ -8,7 +8,6 @@ import sys
 from typing import Any
 
 from rich import box
-from rich.columns import Columns
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -18,11 +17,9 @@ from rich.table import Table
 console = Console(highlight=False)
 
 LIGHT_THEME = {
-    "bg": "white",
     "fg": "black",
     "accent": "blue",
     "success": "green",
-    "warn": "yellow",
     "error": "red",
     "muted": "bright_black",
     "border": "blue",
@@ -59,12 +56,52 @@ def cmd_summary(args: Any) -> None:
         console.print(table)
         return
 
-    table.add_row("Total Records", str(summary.get("total_requests", len(records))))
-    table.add_row("Input Tokens", f"{summary.get('total_input_tokens', 0):,}")
-    table.add_row("Output Tokens", f"{summary.get('total_output_tokens', 0):,}")
+    table.add_row("Total Records", str(summary.get("requests", len(records))))
+    table.add_row("Input Tokens", f"{summary.get('input_tokens', 0):,}")
+    table.add_row("Output Tokens", f"{summary.get('output_tokens', 0):,}")
     table.add_row("Total Tokens", f"{summary.get('total_tokens', 0):,}")
-    table.add_row("Total Cost", _format_cost(summary.get("total_cost_usd", 0)))
+    table.add_row("Total Cost", _format_cost(summary.get("cost_usd", 0)))
+    table.add_row("Budgets", str(summary.get("budget_count", 0)))
+
+    status_bd = summary.get("status_breakdown", {})
+    if status_bd:
+        non_ok = {k: v for k, v in status_bd.items() if k != "success"}
+        if non_ok:
+            table.add_row("Non-OK Requests", ", ".join(f"{k}={v}" for k, v in non_ok.items()))
+
+    anomalies = summary.get("anomalies", {})
+    if anomalies.get("non_success_count"):
+        table.add_row("Anomalies", str(anomalies["non_success_count"]))
+
     console.print(table)
+
+    top_models = summary.get("top_models", [])
+    if top_models:
+        mt = Table(title="Top Models", box=box.SIMPLE, border_style=LIGHT_THEME["border"])
+        mt.add_column("Model", style=LIGHT_THEME["accent"])
+        mt.add_column("Tokens", style=LIGHT_THEME["fg"], justify="right")
+        for m in top_models:
+            mt.add_row(m["model"], f"{m['tokens']:,}")
+        console.print(mt)
+
+    top_providers = summary.get("top_providers", [])
+    if top_providers:
+        pt = Table(title="Top Providers", box=box.SIMPLE, border_style=LIGHT_THEME["border"])
+        pt.add_column("Provider", style=LIGHT_THEME["accent"])
+        pt.add_column("Tokens", style=LIGHT_THEME["fg"], justify="right")
+        for p in top_providers:
+            pt.add_row(p["provider"], f"{p['tokens']:,}")
+        console.print(pt)
+
+    eff = ledger.get_efficiency()
+    if eff.get("avg_efficiency"):
+        et = Table(title="Efficiency", box=box.SIMPLE, border_style=LIGHT_THEME["border"])
+        et.add_column("Metric", style=LIGHT_THEME["accent"])
+        et.add_column("Value", style=LIGHT_THEME["fg"])
+        et.add_row("Avg Out/In Ratio", str(eff["avg_efficiency"]))
+        et.add_row("Cache Hit Rate", str(eff["cache_hit_rate"]))
+        et.add_row("Reasoning Tokens", f"{eff.get('total_reasoning_tokens', 0):,}")
+        console.print(et)
 
     if args.detail:
         providers = ledger.get_spending_by_provider()
@@ -173,27 +210,6 @@ COMMANDS: dict[str, Any] = {
 }
 
 
-def _shortcut_bar() -> Panel:
-    shortcuts = [
-        ("[b]s[/b]", "Summary"),
-        ("[b]e[/b]", "Export"),
-        ("[b]v[/b]", "Verify"),
-        ("[b]c[/b]", "Compact"),
-        ("[b]h[/b]", "Health"),
-        ("[b]p[/b]", "Pricing"),
-        ("[b]r[/b]", "Records"),
-        ("[b]d[/b]", "Detail"),
-        ("[b]q[/b]", "Quit"),
-    ]
-    cols = [f"  [{LIGHT_THEME['accent']}]{(k)}[/] {desc}" for k, desc in shortcuts]
-    return Panel(
-        Columns(cols, equal=True, align="center"),
-        title="[bold]TokenLedger CLI[/bold]",
-        border_style=LIGHT_THEME["border"],
-        subtitle="Press a key or type a command",
-    )
-
-
 def _show_records(ledger: Any) -> None:
     records = ledger.get_records()
     if not records:
@@ -250,16 +266,67 @@ def _show_detail_summary(ledger: Any) -> None:
     console.print(pt)
 
 
+def _show_budgets(ledger: Any) -> None:
+    budgets = ledger.store.get_all_budgets()
+    if not budgets:
+        console.print("[yellow]No budgets configured.[/]")
+        return
+    t = Table(title="Budgets", box=box.SIMPLE, border_style=LIGHT_THEME["border"])
+    t.add_column("Scope", style=LIGHT_THEME["accent"])
+    t.add_column("Scope ID", style=LIGHT_THEME["fg"])
+    t.add_column("Limit", justify="right")
+    t.add_column("Spent", justify="right")
+    t.add_column("Util%", justify="right")
+    for bk, b in budgets.items():
+        util = ledger.store.get_running_totals(b.get("scope", "global"), b.get("scope_id", "all"))
+        spent = util.get("cost_usd", 0)
+        limit = b.get("limit_usd", 0)
+        pct = f"{spent / limit * 100:.1f}" if limit else "N/A"
+        t.add_row(b.get("scope", "?"), bk, _format_cost(limit), _format_cost(spent), pct)
+    console.print(t)
+
+
+def _show_efficiency(ledger: Any) -> None:
+    eff = ledger.get_efficiency()
+    t = Table(title="Efficiency", box=box.SIMPLE, border_style=LIGHT_THEME["border"])
+    t.add_column("Metric", style=LIGHT_THEME["accent"])
+    t.add_column("Value", style=LIGHT_THEME["fg"])
+    t.add_row("Avg Out/In Ratio", str(eff.get("avg_efficiency", 0)))
+    t.add_row("P50 Out/In Ratio", str(eff.get("p50_efficiency", 0)))
+    t.add_row("Cache Hit Rate", str(eff.get("cache_hit_rate", 0)))
+    t.add_row("Reasoning Tokens", f"{eff.get('total_reasoning_tokens', 0):,}")
+    console.print(t)
+
+
+def _show_dimension(ledger: Any, dim: str) -> None:
+    data = ledger.get_spending_by_dimension(dim)
+    if not data:
+        console.print(f"[yellow]No {dim} data found.[/]")
+        return
+    t = Table(title=f"By {dim.title()}", box=box.SIMPLE, border_style=LIGHT_THEME["border"])
+    t.add_column(dim.title(), style=LIGHT_THEME["accent"])
+    t.add_column("Tokens", justify="right")
+    t.add_column("Cost", justify="right")
+    for d in data:
+        t.add_row(d["id"], f"{d.get('total_tokens', 0):,}", _format_cost(d.get("cost_usd", 0)))
+    console.print(t)
+
+
 INTERACTIVE_HELP = """
 [b]Interactive Mode[/b]
-  [b]s[/b]  Summary
-  [b]d[/b]  Detail (per-provider)
+  [b]s[/b]  Summary (with top models, efficiency, status)
+  [b]d[/b]  Detail (per-provider breakdown)
   [b]e[/b]  Export
   [b]v[/b]  Verify
   [b]c[/b]  Compact
   [b]h[/b]  Health
-  [b]p[/b]  Pricing (show all known models)
+  [b]b[/b]  Budgets (with utilization)
+  [b]f[/b]  Efficiency (ratios, cache, reasoning)
+  [b]p[/b]  Pricing (all known models)
   [b]r[/b]  Records (last 20)
+  [b]n[/b]  By Conversation
+  [b]g[/b]  By Agent
+  [b]t[/b]  By Tenant
   [b]?[/b]  Help
   [b]q[/b]  Quit
 """
@@ -295,8 +362,13 @@ def _interactive(args: Any) -> None:
             "v": lambda: cmd_verify(args),
             "c": lambda: cmd_compact(args),
             "h": lambda: cmd_health(args),
+            "b": lambda: _show_budgets(ledger),
+            "f": lambda: _show_efficiency(ledger),
             "p": lambda: _show_pricing(args),
             "r": lambda: _show_records(ledger),
+            "n": lambda: _show_dimension(ledger, "conversation"),
+            "g": lambda: _show_dimension(ledger, "agent"),
+            "t": lambda: _show_dimension(ledger, "tenant"),
         }
         action = actions.get(key)
         if action:

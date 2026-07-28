@@ -22,19 +22,6 @@ PROVIDER_MODEL_PREFIXES: dict[str, list[str]] = {
     "minimax": ["minimax-abab", "abab"],
 }
 
-KNOWN_MODELS: dict[str, str] = {
-    "gpt-4o": "openai", "gpt-4o-mini": "openai", "gpt-4-turbo": "openai",
-    "gpt-3.5-turbo": "openai", "o1-mini": "openai", "o1-preview": "openai",
-    "claude-3-5-sonnet-20241022": "anthropic", "claude-3-opus-20240229": "anthropic",
-    "claude-3-haiku-20240307": "anthropic", "claude-sonnet-4-20250514": "anthropic",
-    "gemini-1.5-pro": "google", "gemini-1.5-flash": "google", "gemini-2.0-flash": "google",
-    "llama-3.1-70b": "groq", "llama-3.1-8b": "groq", "mixtral-8x7b": "groq",
-    "deepseek-chat": "deepseek", "deepseek-coder": "deepseek",
-    "mistral-large": "mistral", "mistral-small": "mistral",
-    "command-r-plus": "cohere", "command-r": "cohere",
-    "llama3.1": "ollama", "llama3.2": "ollama",
-}
-
 MESSAGE_SHAPE_HEURISTICS: list[tuple[str, Any]] = [
     ("anthropic", lambda m: isinstance(m, dict) and "messages" in m and isinstance(m.get("messages"), list)),
     ("google", lambda m: isinstance(m, dict) and "contents" in m and isinstance(m.get("contents"), list)),
@@ -46,8 +33,6 @@ MESSAGE_SHAPE_HEURISTICS: list[tuple[str, Any]] = [
 def detect_provider_from_model(model_name: str) -> str | None:
     if not model_name:
         return None
-    if model_name in KNOWN_MODELS:
-        return KNOWN_MODELS[model_name]
     lower = model_name.lower()
     for provider, prefixes in PROVIDER_MODEL_PREFIXES.items():
         for prefix in prefixes:
@@ -73,39 +58,26 @@ def detect_provider_from_messages(messages: Any) -> str | None:
 def auto_detect(
     model_name: str | None = None,
     messages: Any = None,
-    **kwargs: Any,
+    provider: str | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "provider": None,
-        "model": model_name or kwargs.get("model"),
+        "model": model_name,
         "confidence": "low",
         "detection_method": None,
     }
 
     if model_name:
-        provider = detect_provider_from_model(model_name)
-        if provider:
-            result["provider"] = provider
-            result["confidence"] = "high"
-            result["detection_method"] = "model_name"
+        p = detect_provider_from_model(model_name)
+        if p:
+            result.update(provider=p, confidence="high", detection_method="model_name")
             return result
 
-    provider = detect_provider_from_messages(messages)
-    if provider:
-        result["provider"] = provider
-        result["model"] = result["model"] or "unknown"
-        result["confidence"] = "medium"
-        result["detection_method"] = "message_shape"
+    p = detect_provider_from_messages(messages)
+    if p:
+        result.update(provider=p, model=model_name or "unknown", confidence="medium", detection_method="message_shape")
         return result
 
-    if model_name:
-        provider = detect_provider_from_model(model_name)
-        result["provider"] = provider or "unknown"
-        result["confidence"] = "low" if provider else "none"
-        result["detection_method"] = "model_name_fallback"
-    else:
-        result["provider"] = kwargs.get("provider", "unknown")
-        result["confidence"] = "none"
-        result["detection_method"] = "not_detected"
-
+    result.update(provider=detect_provider_from_model(model_name) or provider or "unknown",
+                  confidence="none", detection_method="not_detected")
     return result

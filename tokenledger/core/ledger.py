@@ -8,7 +8,6 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Callable, TypeVar
 
-from ..ext.autodetect import auto_detect as _auto_detect
 from ..ext.differentiators import (
     CostContract,
     CostContractRegistry,
@@ -314,14 +313,6 @@ class TokenLedger:
         return self.analytics.get_spending_by_dimension("tenant")
 
     # ── Differentiating Features ──────────────────────────────────────────
-
-    @staticmethod
-    def auto_detect(
-        model_name: str | None = None,
-        messages: list | dict | None = None,
-        **kwargs: str,
-    ) -> dict[str, str | None]:
-        return _auto_detect(model_name, messages, **kwargs)
 
     def simulate_cost(
         self, provider: str, model: str, input_tokens: int = 0, output_tokens: int = 0,
