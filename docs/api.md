@@ -14,12 +14,15 @@ TokenLedger(
     max_records: int = 100_000,
     retention_days: int = 90,
     store: Optional[StorageBackend] = None,
-    encryption_key: Optional[bytes] = None,
+    encryption_key: Optional[str | bytes] = None,
     differential_privacy_epsilon: Optional[float] = None,
     redact_prompts: bool = False,
     ghost_mode: bool = False,
 )
 ```
+
+> Note: `encryption_key` enables HMAC-tagged XOR obfuscation of the persisted
+> JSONL file — casual privacy only, **not** encryption.
 
 ### Core Methods
 
@@ -69,7 +72,7 @@ Aggregated usage statistics with budget utilization, top models, anomalies.
 ## Supporting Classes
 
 ### StorageBackend (ABC)
-- `MemoryStore` — In-memory with JSONL persist, ring buffer, encryption
+- `MemoryStore` — In-memory with JSONL persist, ring buffer, obfuscation-at-rest
 - `SqliteStore(path)` — SQLite-backed storage
 
 ### VerificationEngine

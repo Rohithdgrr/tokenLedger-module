@@ -152,7 +152,7 @@ if __name__ == "__main__":
 ## Run
 
 ```bash
-pip install fastapi uvicorn openai tokenledger
+pip install fastapi uvicorn openai tokenledger-module
 python app.py
 # Visit http://localhost:8000/docs for Swagger UI
 ```

@@ -1,5 +1,9 @@
 """CLI tool for TokenLedger — inspect, export, verify, and compact usage data."""
 
+# mypy: disable-error-code="no-redef"
+# The rich import below is optional; the fallback classes in the except
+# branch intentionally reuse the same names.
+
 from __future__ import annotations
 
 import argparse
@@ -7,12 +11,97 @@ import json
 import sys
 from typing import Any
 
-from rich import box
-from rich.console import Console
-from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.prompt import Prompt
-from rich.table import Table
+try:  # rich is optional (install with `pip install tokenledger-module[cli]`)
+    from rich import box
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.progress import Progress, TextColumn
+    from rich.prompt import Prompt
+    from rich.table import Table
+
+    _HAS_RICH = True
+except ImportError:  # pragma: no cover - exercised only when rich is not installed
+    import re
+
+    _HAS_RICH = False
+
+    _TAG_RE = re.compile(r"(?:\[/?[a-zA-Z][a-zA-Z0-9._-]*\]|\[/\])")
+
+    class _FallbackConsole:
+        def __init__(self, *args: Any, **kwargs: Any):
+            pass
+
+        def print(self, *args: Any, **kwargs: Any) -> None:
+            for a in args:
+                print(_TAG_RE.sub("", str(a)))
+
+    class _FallbackBox:
+        SIMPLE = ""
+
+    class _FallbackTable:
+        def __init__(self, title: str = "", *args: Any, **kwargs: Any):
+            self.title = title
+            self._headers: list[str] = []
+            self._rows: list[list[str]] = []
+
+        def add_column(self, name: str, *args: Any, **kwargs: Any) -> None:
+            self._headers.append(str(name))
+
+        def add_row(self, *cells: Any) -> None:
+            self._rows.append([str(c) for c in cells])
+
+        def __str__(self) -> str:
+            rows = [list(r) for r in self._rows]
+            if self._headers:
+                rows.insert(0, self._headers)
+            if not rows:
+                return self.title
+            ncols = max(len(r) for r in rows)
+            widths = [max(len(r[i]) if i < len(r) else 0 for r in rows) for i in range(ncols)]
+            lines = ["  ".join(r[i].ljust(widths[i]) if i < len(r) else " " * widths[i]
+                               for i in range(ncols)) for r in rows]
+            if self.title:
+                lines.insert(0, _TAG_RE.sub("", self.title))
+            return "\n".join(lines)
+
+    class _FallbackPanel:
+        @staticmethod
+        def fit(text: Any, *args: Any, **kwargs: Any) -> str:
+            return str(text)
+
+    class _FallbackProgress:
+        def __init__(self, *args: Any, **kwargs: Any):
+            pass
+
+        def __enter__(self) -> _FallbackProgress:
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            return None
+        def add_task(self, description: str = "", *args: Any, **kwargs: Any) -> Any:
+            if description:
+                print(description)
+
+    class _FallbackTextColumn:
+        def __init__(self, *args: Any, **kwargs: Any):
+            pass
+
+    class _FallbackPrompt:
+        @staticmethod
+        def ask(question: str, default: Any = None, show_default: bool = True, choices: Any = None) -> str:
+            text = question if choices is None else f"{question} ({', '.join(choices)})"
+            answer = input(text + " ").strip()
+            if not answer and default is not None:
+                return str(default)
+            return answer
+
+    Console: Any = _FallbackConsole
+    box: Any = _FallbackBox
+    Table: Any = _FallbackTable
+    Panel: Any = _FallbackPanel
+    Progress: Any = _FallbackProgress
+    TextColumn: Any = _FallbackTextColumn
+    Prompt: Any = _FallbackPrompt
 
 console = Console(highlight=False)
 
@@ -121,7 +210,7 @@ def cmd_summary(args: Any) -> None:
 
 def cmd_export(args: Any) -> None:
     ledger = _build_ledger(args)
-    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
+    with Progress(TextColumn("[progress.description]{task.description}"), console=console) as progress:
         progress.add_task(description="Exporting...", total=None)
         if args.format == "csv":
             ledger.export_csv(args.output)
@@ -152,7 +241,7 @@ def cmd_verify(args: Any) -> None:
 
 def cmd_compact(args: Any) -> None:
     ledger = _build_ledger(args)
-    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
+    with Progress(TextColumn("[progress.description]{task.description}"), console=console) as progress:
         progress.add_task(description="Compacting...", total=None)
         result = ledger.store.compact()
     console.print(

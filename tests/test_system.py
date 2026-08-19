@@ -1,7 +1,7 @@
 """Tests for SystemMonitor — metrics, edge cases, integration."""
 
-import time
 import threading
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -139,25 +139,25 @@ class TestSystemMonitor:
 
 class TestSystemIntegration:
     def test_record_without_system_monitor(self):
-        l = TokenLedger()
-        r = l.record_usage("test", "m", 10, 5)
+        ledger = TokenLedger()
+        r = ledger.record_usage("test", "m", 10, 5)
         assert "system" not in r
 
     def test_record_with_system_monitor(self):
         m = SystemMonitor()
-        l = TokenLedger(system_monitor=m)
-        r = l.record_usage("test", "m", 10, 5, system_context=True)
+        ledger = TokenLedger(system_monitor=m)
+        r = ledger.record_usage("test", "m", 10, 5, system_context=True)
         assert "system" in r
         assert "cpu" in r["system"]
         assert "ram" in r["system"]
 
     def test_record_system_context_without_monitor_raises(self):
-        l = TokenLedger()
+        ledger = TokenLedger()
         with pytest.raises(ValueError, match="system_context=True requires"):
-            l.record_usage("test", "m", 10, 5, system_context=True)
+            ledger.record_usage("test", "m", 10, 5, system_context=True)
 
     def test_system_context_attached_to_interceptor_records(self):
         m = SystemMonitor()
-        l = TokenLedger(system_monitor=m)
-        r = l.record_usage("test", "m", 10, 5, system_context=True)
+        ledger = TokenLedger(system_monitor=m)
+        r = ledger.record_usage("test", "m", 10, 5, system_context=True)
         assert r["system"]["cpu"]["percent"] >= 0

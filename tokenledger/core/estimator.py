@@ -9,7 +9,7 @@ from typing import Any
 class TokenEstimator:
     """Estimate token counts when provider APIs do not report them."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._tiktoken_available = self._check_tiktoken()
         self._encoders: dict[str, Any] = {}
 
@@ -22,12 +22,25 @@ class TokenEstimator:
         except ImportError:
             return False
 
-    def estimate(self, messages: list[dict[str, str]], model: str, provider: str) -> dict[str, Any]:
+    def estimate(
+        self,
+        messages: list[dict[str, str]],
+        model: str,
+        provider: str,
+        output_text: str | None = None,
+    ) -> dict[str, Any]:
+        """Estimate tokens for a request.
+
+        ``output_text`` is optional and used to measure (not invent) the
+        output side. When absent (e.g. pre-call budget checks) ``output_tokens``
+        is 0 rather than a fabricated 40% guess.
+        """
         text = " ".join([str(m.get("content", "")) for m in messages])
-        return self.estimate_from_text(text, provider, model)
+        return self.estimate_from_text(text, provider, model, output_text)
 
     def _estimate_with_tiktoken(self, text: str, model: str) -> int:
         import tiktoken
+
         try:
             if model not in self._encoders:
                 try:
@@ -39,9 +52,22 @@ class TokenEstimator:
         except Exception:
             return self._char_heuristic(text)
 
-    def estimate_from_text(self, text: str, provider: str = "generic", model: str = "unknown") -> dict[str, Any]:
+    def estimate_from_text(
+        self,
+        text: str,
+        provider: str = "generic",
+        model: str = "unknown",
+        output_text: str | None = None,
+    ) -> dict[str, Any]:
         inp = self._estimate_with_tiktoken(text, model) if provider == "openai" and self._tiktoken_available else self._char_heuristic(text)
-        out = max(1, int(inp * 0.4))  # ponytail: 40% output ratio, tune per model if needed
+        if output_text:
+            out = (
+                self._estimate_with_tiktoken(output_text, model)
+                if provider == "openai" and self._tiktoken_available
+                else self._char_heuristic(output_text)
+            )
+        else:
+            out = 0
         return {
             "input_tokens": inp,
             "output_tokens": out,

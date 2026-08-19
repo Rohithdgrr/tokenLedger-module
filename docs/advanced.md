@@ -36,16 +36,19 @@ ledger.record_usage("openai", "gpt-4o", 100, 50, system_context=True)
 # Record includes CPU, RAM, disk, GPU metrics at time of request
 ```
 
-## Encryption-at-Rest
+## Obfuscation-at-Rest
 
 ```python
 ledger = TokenLedger(
     persist_path="usage.jsonl",
-    encryption_key=b"my-secret-key-32-bytes-long!",
+    encryption_key="my-secret-key",  # str or bytes; normalized internally
 )
 ```
 
-All persisted JSONL data is XOR-encrypted. Unreadable without the correct key.
+All persisted JSONL data is XOR-obfuscated and HMAC-tagged. Files written with
+a key are unreadable without it (wrong or missing keys fail with a warning and
+load zero records), but XOR is **not** strong encryption — it is casual
+privacy only, not suitable for compliance-grade secrets.
 
 ## Prompt Redaction
 

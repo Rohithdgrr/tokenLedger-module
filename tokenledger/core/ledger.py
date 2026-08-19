@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import inspect
 import json
+import math
+import secrets
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable, TypeVar
 
@@ -36,7 +40,7 @@ from .analytics import AnalyticsEngine
 from .budget import BudgetEnforcer, BudgetExceededError
 from .estimator import TokenEstimator
 from .extractor import TokenExtractor
-from .interceptor import InterceptionLayer
+from .interceptor import InterceptionLayer, UnknownModelError
 from .pricing import PricingRegistry
 from .record import build_record
 from .store import MemoryStore, StorageBackend
@@ -44,6 +48,7 @@ from .system import SystemMonitor
 from .verifier import VerificationEngine
 
 F = TypeVar("F", bound=Callable)
+
 
 class TokenLedger:
     """Lightweight governance layer for LLM usage tracking."""
@@ -56,7 +61,7 @@ class TokenLedger:
         max_records: int = 100_000,
         retention_days: int = 90,
         store: StorageBackend | None = None,
-        encryption_key: bytes | None = None,
+        encryption_key: str | bytes | None = None,
         differential_privacy_epsilon: float | None = None,
         redact_prompts: bool = False,
         ghost_mode: bool = False,
@@ -78,6 +83,7 @@ class TokenLedger:
         self.differential_privacy_epsilon = differential_privacy_epsilon
         self.redact_prompts = redact_prompts
         self.ghost_mode = ghost_mode
+        self.unknown_model_policy = unknown_model_policy
         self.interceptor = InterceptionLayer(
             ledger=self,
             store=self.store,
@@ -86,8 +92,8 @@ class TokenLedger:
             extractor=self.extractor,
             estimator=self.estimator,
             verifier=self.verifier,
-            unknown_model_policy=unknown_model_policy,
-            ghost_mode=getattr(self, 'ghost_mode', False),
+            unknown_model_policy=self.unknown_model_policy,
+            ghost_mode=getattr(self, "ghost_mode", False),
         )
         self.prompt_cache = PromptCache()
         self.estimator_feedback = EstimatorFeedback()
@@ -121,7 +127,7 @@ class TokenLedger:
         return self.interceptor.wrap_openai(client, provider="mistral")
 
     def wrap_cohere(self, client: Any) -> Any:
-        return self.interceptor.wrap_openai(client, provider="cohere")
+        return self.interceptor.wrap_cohere(client)
 
     def wrap_nvidia(self, client: Any) -> Any:
         return self.interceptor.wrap_openai(client, provider="nvidia")
@@ -149,23 +155,65 @@ class TokenLedger:
         project_id: str = "default",
         **tracking_kwargs: Any,
     ) -> Callable:
+        """Decorator that records usage for the wrapped function.
+
+        Supports sync and async callables, uses extractor fallback when
+        ``input_tokens``/``output_tokens`` are not provided, and never
+        mutates the caller's ``tracking_kwargs``.
+        """
+
         def decorator(func: Callable) -> Callable:
+            if inspect.iscoroutinefunction(func):
+
+                @functools.wraps(func)
+                async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                    start = time.monotonic()
+                    result = await func(*args, **kwargs)
+                    self._record_decorated(provider, model, user_id, project_id, result, start, tracking_kwargs)
+                    return result
+
+                return async_wrapper
+
             @functools.wraps(func)
             def wrapper(*args: Any, **kwargs: Any) -> Any:
+                start = time.monotonic()
                 result = func(*args, **kwargs)
-                inp = tracking_kwargs.pop("input_tokens", 0)
-                out = tracking_kwargs.pop("output_tokens", 0)
-                if not inp and not out:
-                    td = self.extractor.extract(result, provider)
-                    if td:
-                        inp = td.get("input_tokens", 0)
-                        out = td.get("output_tokens", 0)
-                self.record_usage(provider=provider, model=model, user_id=user_id,
-                                  project_id=project_id, input_tokens=inp or 0,
-                                  output_tokens=out or 0, **tracking_kwargs)
+                self._record_decorated(provider, model, user_id, project_id, result, start, tracking_kwargs)
                 return result
+
             return wrapper
+
         return decorator
+
+    def _record_decorated(
+        self,
+        provider: str,
+        model: str,
+        user_id: str,
+        project_id: str,
+        result: Any,
+        start: float,
+        tracking_kwargs: dict[str, Any],
+    ) -> None:
+        inp = tracking_kwargs.get("input_tokens", 0) or 0
+        out = tracking_kwargs.get("output_tokens", 0) or 0
+        if not inp and not out:
+            td = self.extractor.extract(result, provider)
+            if td:
+                inp = td.get("input_tokens", 0)
+                out = td.get("output_tokens", 0)
+        rest = {k: v for k, v in tracking_kwargs.items() if k not in ("input_tokens", "output_tokens")}
+        latency_ms = round((time.monotonic() - start) * 1000, 3)
+        self.record_usage(
+            provider=provider,
+            model=model,
+            user_id=user_id,
+            project_id=project_id,
+            input_tokens=inp,
+            output_tokens=out,
+            latency_ms=latency_ms,
+            **rest,
+        )
 
     def record_usage(
         self,
@@ -197,25 +245,42 @@ class TokenLedger:
             prompt_hash = hashlib.sha256(prompt_hash.encode()).hexdigest()
 
         record = build_record(
-            provider=provider, model=model,
-            input_tokens=input_tokens, output_tokens=output_tokens,
-            user_id=user_id, project_id=project_id,
-            latency_ms=latency_ms, source=source, status=status,
+            provider=provider,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            user_id=user_id,
+            project_id=project_id,
+            latency_ms=latency_ms,
+            source=source,
+            status=status,
             pricing=self.pricing,
             tenant_id=tenant_id,
-            conversation_id=conversation_id, agent_id=agent_id,
+            conversation_id=conversation_id,
+            agent_id=agent_id,
             prompt_hash=prompt_hash,
             reasoning_tokens=reasoning_tokens,
             cached_input_tokens=cached_input_tokens,
             embedding_tokens=embedding_tokens,
-            tool_calls=tool_calls, media_type=media_type, cache_hit=cache_hit,
+            tool_calls=tool_calls,
+            media_type=media_type,
+            cache_hit=cache_hit,
         )
+
+        if not self.pricing.has_model(provider, model):
+            if self.unknown_model_policy == "block":
+                raise UnknownModelError(f"Unknown model: {provider}:{model}")
+            if self.unknown_model_policy == "allow":
+                record["cost_usd"] = 0.0
 
         try:
             self.budget_enforcer.check_budget(
-                user_id=user_id, project_id=project_id,
-                provider=provider, model=model,
-                input_tokens=input_tokens, output_tokens=output_tokens,
+                user_id=user_id,
+                project_id=project_id,
+                provider=provider,
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
             )
         except BudgetExceededError:
             if self.ghost_mode:
@@ -224,6 +289,8 @@ class TokenLedger:
                 raise
 
         if system_context:
+            if self.system_monitor is None:
+                raise ValueError("system_context=True requires a SystemMonitor instance")
             record["system"] = self.system_monitor.snapshot()
 
         verified = self.verifier.verify(record)
@@ -236,22 +303,33 @@ class TokenLedger:
         return verified
 
     def _add_noise(self, record: dict[str, Any]) -> dict[str, Any]:
-        import random
+        """Add Laplace noise (epsilon-DP) to token/cost fields in the record."""
         eps = self.differential_privacy_epsilon or 1.0
         scale = 1.0 / eps
-        record["input_tokens"] = max(0, int(record.get("input_tokens", 0) + random.gauss(0, scale)))
-        record["output_tokens"] = max(0, int(record.get("output_tokens", 0) + random.gauss(0, scale)))
+        record["input_tokens"] = max(0, int(record.get("input_tokens", 0) + self._laplace_sample(scale)))
+        record["output_tokens"] = max(0, int(record.get("output_tokens", 0) + self._laplace_sample(scale)))
         record["total_tokens"] = record["input_tokens"] + record["output_tokens"]
-        record["cost_usd"] = max(0.0, record.get("cost_usd", 0) + random.gauss(0, scale * 0.001))
+        record["cost_usd"] = max(0.0, record.get("cost_usd", 0) + self._laplace_sample(scale * 0.001))
         record["_dp_noise_applied"] = True
         return record
+
+    @staticmethod
+    def _laplace_sample(scale: float) -> float:
+        """Sample from Laplace(0, scale) using inverse CDF, pure stdlib.
+
+        Uses ``secrets`` for a cryptographically secure uniform value —
+        cheaper than a 64-bit Mersenne draw and safe for DP noise.
+        """
+        u = 1e-12 + secrets.randbelow(2**53) / 2**53 * (1.0 - 2e-12)
+        if u < 0.5:
+            return scale * math.log(2 * u)
+        return -scale * math.log(2 * (1 - u))
 
     def get_records(self) -> list[dict[str, Any]]:
         return self.store.get_records()
 
     def set_budget(self, scope: str, scope_id: str, limit_usd: float, reset_cycle: str = "monthly") -> None:
-        self.store.set_budget(scope, scope_id, {"scope": scope, "scope_id": scope_id,
-                                                  "limit_usd": limit_usd, "reset_cycle": reset_cycle})
+        self.store.set_budget(scope, scope_id, {"scope": scope, "scope_id": scope_id, "limit_usd": limit_usd, "reset_cycle": reset_cycle})
 
     def get_summary(self, scope: str = "global", scope_id: str = "all") -> dict[str, Any]:
         return self.analytics.get_summary(scope, scope_id)
@@ -268,8 +346,11 @@ class TokenLedger:
     def export_json(self, filepath: str) -> None:
         self.exporter.export_json(filepath, self.get_records())
 
-    def export_audit_json(self, filepath: str) -> None:
-        """Export with verification status and checksums."""
+    def export_audit_json(self, filepath: str | None = None) -> dict[str, Any]:
+        """Export with verification status and checksums.
+
+        Returns the audit bundle; writes it to ``filepath`` when provided.
+        """
         records = self.get_records()
         audit = {
             "exported_at": datetime.now(timezone.utc).isoformat(),
@@ -278,8 +359,10 @@ class TokenLedger:
             "records": records,
         }
         audit["_checksum"] = hashlib.sha256(json.dumps(audit, sort_keys=True, default=str).encode()).hexdigest()
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(audit, f, indent=2, default=str)
+        if filepath:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(audit, f, indent=2, default=str)
+        return audit
 
     def register_pricing(self, provider: str, model: str, input_cost_per_1k: float, output_cost_per_1k: float) -> None:
         self.pricing.register_custom(provider, model, input_cost_per_1k, output_cost_per_1k)
@@ -288,9 +371,7 @@ class TokenLedger:
         return self.pricing.get_pricing(provider, model)
 
     def apply_retention(self, max_age_days: int | None = None) -> None:
-        if max_age_days is not None:
-            self.store.retention.max_age_days = max_age_days
-        self.store._apply_retention()
+        self.store.apply_retention(max_age_days)
 
     def verify_immutability(self) -> list[str]:
         return self.store.verify_immutability()
@@ -315,7 +396,11 @@ class TokenLedger:
     # ── Differentiating Features ──────────────────────────────────────────
 
     def simulate_cost(
-        self, provider: str, model: str, input_tokens: int = 0, output_tokens: int = 0,
+        self,
+        provider: str,
+        model: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
         messages: list[dict] | None = None,
     ) -> dict[str, Any]:
         return _simulate_cost(self.pricing, provider, model, input_tokens, output_tokens, messages)
@@ -332,13 +417,22 @@ class TokenLedger:
         return _verify_signed_ledger(bundle, key)
 
     def add_route_option(
-        self, provider: str, model: str, input_cost_per_1k: float, output_cost_per_1k: float,
-        max_tokens: int | None = None, latency_p95_ms: float | None = None,
+        self,
+        provider: str,
+        model: str,
+        input_cost_per_1k: float,
+        output_cost_per_1k: float,
+        max_tokens: int | None = None,
+        latency_p95_ms: float | None = None,
     ) -> None:
         self.model_router.add_option(RouteOption(provider, model, input_cost_per_1k, output_cost_per_1k, max_tokens, latency_p95_ms))
 
     def add_cost_contract(
-        self, name: str, max_cost_usd: float, scope: str = "global", scope_id: str = "all",
+        self,
+        name: str,
+        max_cost_usd: float,
+        scope: str = "global",
+        scope_id: str = "all",
         callback: Callable | None = None,
     ) -> CostContract:
         c = CostContract(name, max_cost_usd, scope, scope_id, callback=callback)
@@ -349,8 +443,12 @@ class TokenLedger:
         return self.prompt_evolution.track(name, content, metadata)
 
     def register_local_model(
-        self, name: str, watts_per_second: float = 10.0, cost_per_kwh: float = 0.12,
-        tokens_per_second: float = 30.0, hardware_cost: float = 0.0,
+        self,
+        name: str,
+        watts_per_second: float = 10.0,
+        cost_per_kwh: float = 0.12,
+        tokens_per_second: float = 30.0,
+        hardware_cost: float = 0.0,
     ) -> None:
         self.local_models.register(LocalModelCost(name, watts_per_second, cost_per_kwh, tokens_per_second, hardware_cost))
 
@@ -361,17 +459,17 @@ class TokenLedger:
         if scope == "global":
             return True
         if scope == "provider":
-            return record.get("provider") == scope_id
+            return bool(record.get("provider") == scope_id)
         if scope == "model":
-            return record.get("model") == scope_id
+            return bool(record.get("model") == scope_id)
         if scope == "user":
-            return record.get("user_id", "anonymous") == scope_id
+            return bool(record.get("user_id", "anonymous") == scope_id)
         if scope == "project":
-            return record.get("project_id", "default") == scope_id
+            return bool(record.get("project_id", "default") == scope_id)
         if scope == "conversation":
-            return record.get("conversation_id") == scope_id
+            return bool(record.get("conversation_id") == scope_id)
         if scope == "agent":
-            return record.get("agent_id") == scope_id
+            return bool(record.get("agent_id") == scope_id)
         if scope == "tenant":
-            return record.get("tenant_id") == scope_id
+            return bool(record.get("tenant_id") == scope_id)
         return False

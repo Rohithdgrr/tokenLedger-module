@@ -24,7 +24,7 @@ The package works by **wrapping LLM API calls**. When a request is made, TokenLe
 - **CLI** — `tokenledger summary|export|verify|compact|health|update-pricing` from the terminal.
 - **SQLite Storage** — Optional SQLite backend via `TokenLedger(store=SqliteStore("usage.db"))`.
 - **Multi-Tenant** — `tenant_id` dimension for isolating usage across organizations or environments.
-- **Encryption-at-Rest** — XOR-encrypt persisted JSONL files with an `encryption_key`.
+- **Obfuscation-at-Rest** — HMAC-tagged XOR obfuscation for persisted JSONL via an `encryption_key` (casual privacy, not strong encryption).
 - **Prompt Redaction** — `redact_prompts=True` hashes prompt content before recording.
 - **Differential Privacy** — Laplace noise injection via `differential_privacy_epsilon` parameter.
 - **Audit Export** — `export_audit_json()` wraps records in a signed envelope with checksum.
@@ -42,10 +42,18 @@ The package works by **wrapping LLM API calls**. When a request is made, TokenLe
 ## Installation
 
 ```bash
-pip install tokenledger
+pip install tokenledger-module        # core (zero hard dependencies)
+pip install "tokenledger-module[all]" # + provider SDKs, CLI (rich), system monitoring
+pip install "tokenledger-module[cli]" # CLI pretty-printing (rich)
 ```
 
-TokenLedger has zero required external services. All data lives in memory. For optional file persistence, no extra dependencies are needed.
+The import and CLI names are `tokenledger`:
+
+```python
+from tokenledger import TokenLedger
+```
+
+TokenLedger has zero required external services. All data lives in memory. For optional file persistence, no extra dependencies are needed. The CLI works without `rich` too (falls back to plain text), but you get nicer output with `tokenledger-module[cli]`.
 
 ---
 
@@ -422,7 +430,7 @@ tokenledger/
 | `retention_days` | `int` | `90` | Max age in days before auto-purge |
 | `store` | `StorageBackend` | `MemoryStore()` | Storage backend (SQLite via `SqliteStore`) |
 | `tenant_id` | `str` | `None` | Isolate usage records by tenant |
-| `encryption_key` | `str` | `None` | XOR key for JSONL-at-rest encryption |
+| `encryption_key` | `str`/`bytes` | `None` | XOR+HMAC obfuscation key for JSONL-at-rest (casual privacy, not encryption) |
 | `redact_prompts` | `bool` | `False` | Hash prompt content before recording |
 | `differential_privacy_epsilon` | `float` | `None` | Laplace noise scale (lower = more privacy) |
 | `on_budget_exceeded` | `callable` | `None` | Callback fired when a budget is exceeded |
@@ -449,7 +457,7 @@ Interceptor configuration (set after init):
 - **Single-process**: TokenLedger is designed for single-process apps. Multi-process budget enforcement requires external coordination.
 - **Rate limiter**: Simple token bucket suitable for single-process use. For distributed rate limiting, use an external proxy.
 - **SQLite concurrent writes**: SqliteStore uses SQLite's default isolation — safe for single-process concurrent reads/writes; multi-process writes require an external connection pool.
-- **Encryption-at-rest**: Uses lightweight XOR cipher (not AES). Sufficient for casual privacy, not for compliance-grade requirements.
+- **Obfuscation-at-rest**: Persisted JSONL with an `encryption_key` uses an XOR+HMAC scheme. This is obfuscation, **not** encryption — sufficient for casual privacy, not for compliance-grade requirements.
 - **Mock-only integration tests**: Provider integration tests use mocked responses. Real API credentials are needed for end-to-end provider tests.
 
 ## Contributing

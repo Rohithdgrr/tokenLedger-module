@@ -45,18 +45,19 @@ print(f"Spent: ${summary['cost_usd']:.4f}")
 | Category | Features |
 |---|---|
 | **Core** | Record usage manually, wrap 16 providers, streaming, async, budget enforcement, circuit breaker, rate limiter, retry with backoff |
-| **Storage** | In-memory (default), JSONL persist, SQLite, pluggable `StorageBackend` protocol, ring buffer, age-based retention, encryption-at-rest |
+| **Storage** | In-memory (default), JSONL persist, SQLite, pluggable `StorageBackend` protocol, ring buffer, age-based retention, obfuscation-at-rest |
 | **Analytics** | Summary (budgets, top models, anomalies), spending by provider/model/user/project/conversation/agent/tenant, trends (hour/day/week/month), latency stats (p50/p95/p99), efficiency, cost breakdown |
 | **Verification** | 6 built-in rules (token arithmetic, negative token, cost recalculation, unknown model, negative latency, anomaly detection), pluggable `VerificationRule` ABC, SHA-256 checksums with tamper detection |
 | **CLI** | `summary`, `export` (csv/json), `verify`, `compact`, `health`, `update-pricing` |
 | **Extras** | OpenTelemetry instrumentation, Webhook/Slack notifier, async store wrapper, `@ledger.track` decorator, per-provider config, external pricing via JSON, `get_health()` |
-| **Privacy** | Prompt redaction (SHA-256 hash), XOR encryption-at-rest, differential privacy (Laplace noise) |
+| **Privacy** | Prompt redaction (SHA-256 hash), XOR obfuscation-at-rest (casual privacy, not encryption), differential privacy (Laplace noise) |
 | **Differentiators** | Ghost mode (dry-run), what-if cost simulator, agent/conversation ROI, signed offline ledgers (HMAC), prompt cache with near-duplicate detection, self-improving estimator, smart model router, agentic cost contracts, prompt evolution tracker, local LLM real-cost modeling |
 
 ## Installation
 
 ```bash
-pip install tokenledger
+pip install tokenledger-module        # core (zero hard dependencies)
+pip install "tokenledger-module[all]" # + provider SDKs, CLI (rich), system monitoring
 ```
 
 Zero external services required. All data lives in memory by default.

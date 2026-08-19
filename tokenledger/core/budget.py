@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from .pricing import PricingRegistry
-from .store import MemoryStore
+from .store import StorageBackend
 
 
 class BudgetExceededError(Exception):
@@ -33,10 +33,11 @@ class BudgetEnforcer:
     """
     Enforces spending limits before API calls are made.
     Supports multiple budget scopes: global, project, user, user_project.
-    Uses running totals for O(1) spend lookup.
+    Uses O(1) running totals for ``never`` budgets and windowed scans for
+    daily/weekly/monthly reset cycles.
     """
 
-    def __init__(self, store: MemoryStore, pricing: PricingRegistry):
+    def __init__(self, store: StorageBackend, pricing: PricingRegistry):
         self.store = store
         self.pricing = pricing
         self._avg_output_per_model: dict[str, float] = defaultdict(lambda: 0.5)
@@ -90,31 +91,35 @@ class BudgetEnforcer:
         return budgets
 
     def _calculate_current_spend(self, budget: dict[str, Any]) -> float:
-        """Calculate current spend using running totals (O(1))."""
+        """Calculate current spend within the budget's reset window.
+
+        Windowed budgets (daily/weekly/monthly) are computed by scanning
+        records inside the current window; ``never`` budgets use running
+        totals for O(1) lookups. ``user_project`` spends always use the
+        intersection scan because no running-total dimension captures both
+        dimensions at once.
+        """
         scope = budget.get("scope", "global")
         scope_id = budget.get("scope_id", "")
+        reset_cycle = budget.get("reset_cycle", "monthly")
 
-        if scope == "global":
-            key = "global:all"
-        elif scope in ("project", "user"):
-            key = f"{scope}:{scope_id}"
-        elif scope == "user_project":
-            parts = scope_id.split(":")
-            if len(parts) == 2:
-                key_user = f"user:{parts[0]}"
-                key_project = f"project:{parts[1]}"
-                user_totals = self.store.running_totals.get(key_user, {})
-                project_totals = self.store.running_totals.get(key_project, {})
-                return round(
-                    max(user_totals.get("cost_usd", 0), project_totals.get("cost_usd", 0)),
-                    10,
-                )
-            return 0.0
-        else:
-            return 0.0
+        if reset_cycle == "never" and scope != "user_project":
+            key = "global:all" if scope == "global" else f"{scope}:{scope_id}"
+            totals = self.store.running_totals.get(key, {})
+            return round(float(totals.get("cost_usd", 0)), 10)
 
-        totals = self.store.running_totals.get(key, {})
-        return round(totals.get("cost_usd", 0), 10)
+        window_start = self._get_window_start(reset_cycle)
+        total = 0.0
+        for record in self.store.get_records():
+            ts = record.get("timestamp", "")
+            if ts and ts < window_start:
+                continue
+            if record.get("status") in ("blocked", "error") or record.get("_ghost"):
+                continue
+            if not self._record_matches_budget(record, budget):
+                continue
+            total += float(record.get("cost_usd", 0) or 0)
+        return round(total, 10)
 
     def _get_window_start(self, reset_cycle: str) -> str:
         """Get the start of the current budget window."""
@@ -141,13 +146,13 @@ class BudgetEnforcer:
         if scope == "global":
             return True
         if scope == "project":
-            return record.get("project_id", "default") == scope_id
+            return bool(record.get("project_id", "default") == scope_id)
         if scope == "user":
-            return record.get("user_id", "anonymous") == scope_id
+            return bool(record.get("user_id", "anonymous") == scope_id)
         if scope == "user_project":
             parts = scope_id.split(":")
             if len(parts) == 2:
-                return record.get("user_id") == parts[0] and record.get("project_id") == parts[1]
+                return bool(record.get("user_id") == parts[0] and record.get("project_id") == parts[1])
         return False
 
     def _estimate_request_cost(
@@ -175,7 +180,7 @@ class BudgetEnforcer:
             estimated_input = 100
             estimated_output = max_tokens if max_tokens else 50
 
-        return estimated_input * pricing["input_per_token"] + estimated_output * pricing["output_per_token"]
+        return float(estimated_input) * float(pricing["input_per_token"]) + float(estimated_output) * float(pricing["output_per_token"])
 
     def update_model_stats(self, model: str, input_tokens: int, output_tokens: int) -> None:
         """Update cached average output ratio for a model."""

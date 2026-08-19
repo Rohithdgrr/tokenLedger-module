@@ -1,59 +1,66 @@
 """Tests for all 10 differentiating features."""
 import pytest
-from tokenledger import TokenLedger, BudgetExceededError, compute_roi, sign_ledger, verify_signed_ledger, simulate_cost
+
+from tokenledger import BudgetExceededError, TokenLedger, compute_roi, sign_ledger, verify_signed_ledger
 from tokenledger.ext.differentiators import (
-    PromptCache, EstimatorFeedback, ModelRouter, RouteOption,
-    CostContract, CostContractRegistry, PromptEvolutionTracker,
-    LocalModelCost, LocalModelRegistry,
+    CostContract,
+    CostContractRegistry,
+    EstimatorFeedback,
+    LocalModelCost,
+    LocalModelRegistry,
+    ModelRouter,
+    PromptCache,
+    PromptEvolutionTracker,
+    RouteOption,
 )
 
 
 class TestGhostMode:
     def test_ghost_mode_does_not_raise(self):
-        l = TokenLedger(ghost_mode=True)
-        l.set_budget("user", "alice", limit_usd=0.0)
-        rec = l.record_usage("openai", "gpt-4", 100, 50, user_id="alice")
+        ledger = TokenLedger(ghost_mode=True)
+        ledger.set_budget("user", "alice", limit_usd=0.0)
+        rec = ledger.record_usage("openai", "gpt-4", 100, 50, user_id="alice")
         assert rec["_ghost"] is True
 
     def test_ghost_mode_marks_records(self):
-        l = TokenLedger(ghost_mode=False)
-        l.set_budget("user", "bob", limit_usd=0.0)
+        ledger = TokenLedger(ghost_mode=False)
+        ledger.set_budget("user", "bob", limit_usd=0.0)
         with pytest.raises(BudgetExceededError):
-            l.record_usage("openai", "gpt-4", 100, 50, user_id="bob")
+            ledger.record_usage("openai", "gpt-4", 100, 50, user_id="bob")
 
     def test_ghost_does_not_affect_normal(self):
-        l = TokenLedger(ghost_mode=True)
-        rec = l.record_usage("openai", "gpt-4", 100, 50)
+        ledger = TokenLedger(ghost_mode=True)
+        rec = ledger.record_usage("openai", "gpt-4", 100, 50)
         assert "_ghost" not in rec or not rec["_ghost"]
 
 
 class TestSimulateCost:
     def test_simulate_known_model(self):
-        l = TokenLedger()
-        result = l.simulate_cost("openai", "gpt-4o", input_tokens=1000, output_tokens=500)
+        ledger = TokenLedger()
+        result = ledger.simulate_cost("openai", "gpt-4o", input_tokens=1000, output_tokens=500)
         assert result["estimated_cost_usd"] == pytest.approx(0.005 * 1000/1000 + 0.015 * 500/1000)
         assert result["provider"] == "openai"
         assert result["model"] == "gpt-4o"
 
     def test_simulate_with_messages(self):
-        l = TokenLedger()
+        ledger = TokenLedger()
         messages = [{"role": "user", "content": "Hello world, this is a test!"}]
-        result = l.simulate_cost("openai", "gpt-4", messages=messages)
+        result = ledger.simulate_cost("openai", "gpt-4", messages=messages)
         assert result["estimated_cost_usd"] > 0
         assert result["input_tokens"] > 0
 
 
 class TestROI:
     def test_roi_empty(self):
-        l = TokenLedger()
-        roi = l.get_roi()
+        ledger = TokenLedger()
+        roi = ledger.get_roi()
         assert roi["total_requests"] == 0
 
     def test_roi_with_records(self):
-        l = TokenLedger()
-        l.record_usage("openai", "gpt-4", 100, 50, user_id="alice", project_id="app1")
-        l.record_usage("openai", "gpt-4", 200, 100, user_id="alice", project_id="app1")
-        roi = l.get_roi("user", "alice")
+        ledger = TokenLedger()
+        ledger.record_usage("openai", "gpt-4", 100, 50, user_id="alice", project_id="app1")
+        ledger.record_usage("openai", "gpt-4", 200, 100, user_id="alice", project_id="app1")
+        roi = ledger.get_roi("user", "alice")
         assert roi["total_requests"] == 2
         assert roi["total_output_tokens"] == 150
         assert roi["cost_per_output_token"] > 0
@@ -66,9 +73,9 @@ class TestROI:
 
 class TestSignedLedger:
     def test_sign_and_verify(self):
-        l = TokenLedger()
-        l.record_usage("openai", "gpt-4", 100, 50)
-        bundle = l.sign_ledger("my-key")
+        ledger = TokenLedger()
+        ledger.record_usage("openai", "gpt-4", 100, 50)
+        bundle = ledger.sign_ledger("my-key")
         assert bundle["algorithm"] == "hmac-sha256"
         assert bundle["record_count"] == 1
         assert verify_signed_ledger(bundle, "my-key") is True
@@ -113,7 +120,7 @@ class TestEstimatorFeedback:
 
     def test_adjust_only_after_threshold(self):
         fb = EstimatorFeedback()
-        for i in range(6):
+        for _i in range(6):
             fb.report("gpt-4", "openai", 100, 120)
         adjusted = fb.adjust("gpt-4", "openai", 100)
         assert adjusted == 120  # 100 * 1.2
@@ -227,34 +234,35 @@ class TestLocalModelCost:
         assert reg.estimate_cost("nonexistent", 1000, 500) is None
 
     def test_ledger_hooks(self):
-        l = TokenLedger()
-        l.register_local_model("my-local-model", watts_per_second=10, cost_per_kwh=0.12, tokens_per_second=30)
-        cost = l.estimate_local_cost("my-local-model", 1000, 500)
+        ledger = TokenLedger()
+        ledger.register_local_model("my-local-model", watts_per_second=10, cost_per_kwh=0.12, tokens_per_second=30)
+        cost = ledger.estimate_local_cost("my-local-model", 1000, 500)
         assert cost is not None
         assert cost > 0
 
 class TestRouteOptionOnLedger:
     def test_add_route_and_route(self):
-        l = TokenLedger()
-        l.add_route_option("openai", "gpt-4o", 0.005, 0.015)
-        l.add_route_option("openai", "gpt-4o-mini", 0.00015, 0.0006)
-        best = l.model_router.route(input_tokens=1000, output_tokens=500)
+        ledger = TokenLedger()
+        ledger.add_route_option("openai", "gpt-4o", 0.005, 0.015)
+        ledger.add_route_option("openai", "gpt-4o-mini", 0.00015, 0.0006)
+        best = ledger.model_router.route(input_tokens=1000, output_tokens=500)
         assert best is not None
         assert best.model == "gpt-4o-mini"
 
 class TestCostContractOnLedger:
     def test_ledger_contract(self):
-        l = TokenLedger()
-        l.add_cost_contract("my-contract", max_cost_usd=5.0)
-        assert l.cost_contracts.check("my-contract", 3.0) is True
-        assert l.cost_contracts.check("my-contract", 3.0) is False
+        ledger = TokenLedger()
+        ledger.add_cost_contract("my-contract", max_cost_usd=5.0)
+        assert ledger.cost_contracts.check("my-contract", 3.0) is True
+        assert ledger.cost_contracts.check("my-contract", 3.0) is False
 
 class TestPromptEvolutionOnLedger:
     def test_ledger_track_prompt(self):
-        l = TokenLedger()
-        v1 = l.track_prompt_version("prompt-a", "Hello")
-        v2 = l.track_prompt_version("prompt-a", "Hello world")
+        ledger = TokenLedger()
+        v1 = ledger.track_prompt_version("prompt-a", "Hello")
+        v2 = ledger.track_prompt_version("prompt-a", "Hello world")
+        assert v1["version"] == 1
         assert v2["version"] == 2
         assert "diff" in v2
-        hist = l.prompt_evolution.get_history("prompt-a")
+        hist = ledger.prompt_evolution.get_history("prompt-a")
         assert len(hist) == 2

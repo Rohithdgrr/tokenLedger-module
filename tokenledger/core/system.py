@@ -88,8 +88,10 @@ def _temperature() -> dict[str, Any]:
     try:
         import subprocess
         out = subprocess.check_output(
-            "wmic /namespace:\\\\root\\wmi PATH MSAcpi_ThermalZoneTemperature get CurrentTemperature /value",
-            shell=True, timeout=5)
+            ["wmic", "/namespace:\\\\root\\wmi", "PATH", "MSAcpi_ThermalZoneTemperature",
+             "get", "CurrentTemperature", "/value"],
+            timeout=5,
+        )
         val = out.decode().strip()
         if "CurrentTemperature" in val:
             temp_k = float(val.split("=")[1].strip())
@@ -103,8 +105,9 @@ def _gpu() -> dict[str, Any]:
     try:
         import subprocess
         out = subprocess.check_output(
-            "nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits",
-            shell=True, timeout=5, stderr=subprocess.DEVNULL,
+            ["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
+             "--format=csv,noheader,nounits"],
+            timeout=5, stderr=subprocess.DEVNULL,
         )
         result = {}
         for line in out.decode().strip().splitlines():

@@ -4,10 +4,10 @@ import contextlib
 import json
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from tokenledger.core.store import StorageBackend
+from tokenledger.core.store import StorageBackend, _is_billable
 
 
 class SqliteStore(StorageBackend):
@@ -25,12 +25,23 @@ class SqliteStore(StorageBackend):
         self.lock = threading.RLock()
         self.budgets: dict[str, dict[str, Any]] = {}
         self.running_totals: dict[str, dict[str, Any]] = {}
+        self._local = threading.local()
         self._init_db()
+
+    def _conn(self) -> sqlite3.Connection:
+        """Return this thread's persistent connection (WAL mode, no per-op connect)."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("PRAGMA journal_mode=WAL")
+            self._local.conn = conn
+        return conn
 
     def _init_db(self) -> None:
         with self.lock:
             conn = sqlite3.connect(self.db_path)
             try:
+                conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS records (
                         record_id TEXT PRIMARY KEY,
@@ -57,7 +68,16 @@ class SqliteStore(StorageBackend):
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_provider ON records(provider)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_user ON records(user_id)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_tenant ON records(tenant_id)")
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS budgets (
+                        key TEXT PRIMARY KEY,
+                        config TEXT
+                    )
+                """)
                 conn.commit()
+                for key, config in conn.execute("SELECT key, config FROM budgets"):
+                    with contextlib.suppress(json.JSONDecodeError, TypeError):
+                        self.budgets[key] = json.loads(config)
             finally:
                 conn.close()
         self._rebuild_running_totals()
@@ -68,6 +88,8 @@ class SqliteStore(StorageBackend):
             self._update_running_totals(r)
 
     def _update_running_totals(self, record: dict[str, Any]) -> None:
+        if not _is_billable(record):
+            return
         dimensions = [
             ("global", "all"),
             ("provider", record.get("provider", "unknown")),
@@ -80,10 +102,16 @@ class SqliteStore(StorageBackend):
             dimensions.append(("tenant", record["tenant_id"]))
         for scope, scope_id in dimensions:
             key = f"{scope}:{scope_id}"
-            agg = self.running_totals.setdefault(key, {
-                "requests": 0, "input_tokens": 0, "output_tokens": 0,
-                "total_tokens": 0, "cost_usd": 0.0,
-            })
+            agg = self.running_totals.setdefault(
+                key,
+                {
+                    "requests": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "cost_usd": 0.0,
+                },
+            )
             agg["requests"] += 1
             agg["input_tokens"] += record.get("input_tokens", 0)
             agg["output_tokens"] += record.get("output_tokens", 0)
@@ -92,17 +120,17 @@ class SqliteStore(StorageBackend):
 
     def insert_record(self, record: dict[str, Any]) -> None:
         with self.lock:
-            extra = {k: v for k, v in record.items()
-                     if k not in self._COLUMNS and k != "_checksum"}
-            conn = sqlite3.connect(self.db_path)
-            try:
-                conn.execute("""
+            extra = {k: v for k, v in record.items() if k not in self._COLUMNS and k != "_checksum"}
+            conn = self._conn()
+            conn.execute(
+                """
                     INSERT OR REPLACE INTO records
                     (record_id, timestamp, provider, model, input_tokens, output_tokens,
                      total_tokens, cost_usd, latency_ms, user_id, project_id, status, source,
                      conversation_id, agent_id, prompt_hash, tenant_id, extra)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """, (
+                """,
+                (
                     record.get("record_id"),
                     record.get("timestamp"),
                     record.get("provider"),
@@ -121,51 +149,74 @@ class SqliteStore(StorageBackend):
                     record.get("prompt_hash"),
                     record.get("tenant_id"),
                     json.dumps(extra, default=str) if extra else None,
-                ))
-                conn.commit()
-            finally:
-                conn.close()
+                ),
+            )
+            conn.commit()
             self._update_running_totals(record)
 
     _COLUMNS = {
-        "record_id", "timestamp", "provider", "model", "input_tokens",
-        "output_tokens", "total_tokens", "cost_usd", "latency_ms",
-        "user_id", "project_id", "status", "source",
-        "conversation_id", "agent_id", "prompt_hash", "tenant_id",
+        "record_id",
+        "timestamp",
+        "provider",
+        "model",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cost_usd",
+        "latency_ms",
+        "user_id",
+        "project_id",
+        "status",
+        "source",
+        "conversation_id",
+        "agent_id",
+        "prompt_hash",
+        "tenant_id",
     }
 
     def get_records(self, limit: Optional[int] = None) -> list[dict[str, Any]]:
         with self.lock:
-            conn = sqlite3.connect(self.db_path)
-            try:
-                cursor = conn.execute(
-                    "SELECT * FROM records ORDER BY timestamp" +
-                    (" LIMIT ?" if limit else ""),
-                    (limit,) if limit else (),
-                )
-                rows = []
-                for row in cursor.fetchall():
-                    r = dict(zip([d[0] for d in cursor.description], row))
-                    extra = r.pop("extra", None)
-                    if extra:
-                        with contextlib.suppress(json.JSONDecodeError, TypeError):
-                            r.update(json.loads(extra))
-                    rows.append(r)
-                return rows
-            finally:
-                conn.close()
+            conn = self._conn()
+            cursor = conn.execute(
+                "SELECT * FROM records ORDER BY timestamp" + (" LIMIT ?" if limit else ""),
+                (limit,) if limit else (),
+            )
+            rows = []
+            for row in cursor.fetchall():
+                r = dict(zip([d[0] for d in cursor.description], row))
+                extra = r.pop("extra", None)
+                if extra:
+                    with contextlib.suppress(json.JSONDecodeError, TypeError):
+                        r.update(json.loads(extra))
+                rows.append(r)
+            return rows
 
     def get_running_totals(self, scope: str, scope_id: str) -> dict[str, Any]:
         key = f"{scope}:{scope_id}"
         with self.lock:
-            return dict(self.running_totals.get(key, {
-                "requests": 0, "input_tokens": 0, "output_tokens": 0,
-                "total_tokens": 0, "cost_usd": 0.0,
-            }))
+            return dict(
+                self.running_totals.get(
+                    key,
+                    {
+                        "requests": 0,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                        "cost_usd": 0.0,
+                    },
+                )
+            )
 
     def set_budget(self, scope: str, scope_id: str, budget_config: dict[str, Any]) -> None:
+        key = f"{scope}:{scope_id}"
         with self.lock:
-            self.budgets[f"{scope}:{scope_id}"] = budget_config
+            self.budgets[key] = budget_config
+            conn = self._conn()
+            conn.execute(
+                "INSERT OR REPLACE INTO budgets (key, config) VALUES (?, ?)",
+                (key, json.dumps(budget_config, default=str)),
+            )
+            conn.commit()
 
     def get_budget(self, scope: str, scope_id: str) -> Optional[dict[str, Any]]:
         with self.lock:
@@ -184,6 +235,7 @@ class SqliteStore(StorageBackend):
             if "_checksum" in r:
                 raw = json.dumps({k: v for k, v in r.items() if k != "_checksum"}, sort_keys=True, default=str).encode()
                 import hashlib
+
                 actual = hashlib.sha256(raw).hexdigest()
                 if expected != actual:
                     tampered.append(r.get("record_id", "unknown"))
@@ -191,34 +243,49 @@ class SqliteStore(StorageBackend):
 
     def clear(self) -> None:
         with self.lock:
-            conn = sqlite3.connect(self.db_path)
-            try:
-                conn.execute("DELETE FROM records")
-                conn.commit()
-            finally:
-                conn.close()
+            conn = self._conn()
+            conn.execute("DELETE FROM records")
+            conn.execute("DELETE FROM budgets")
+            conn.commit()
             self.running_totals.clear()
             self.budgets.clear()
 
-    def compact(self) -> dict[str, Any]:
-        before = len(self.get_records())
-        cutoff = (datetime.now(timezone.utc)).isoformat()
+    def compact(self, max_age_days: Optional[int] = None) -> dict[str, Any]:
+        """Remove records older than ``max_age_days`` (default 90) and cap
+        the table at ``max_records`` newest rows."""
+        days = max_age_days if max_age_days is not None else 90
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         with self.lock:
-            conn = sqlite3.connect(self.db_path)
-            try:
-                conn.execute("DELETE FROM records WHERE timestamp < ?", (cutoff,))
-                conn.commit()
-            finally:
-                conn.close()
+            before = self.get_record_count()
+            conn = self._conn()
+            conn.execute("DELETE FROM records WHERE timestamp < ?", (cutoff,))
+            conn.execute(
+                """
+                DELETE FROM records WHERE record_id IN (
+                    SELECT record_id FROM records
+                    ORDER BY timestamp DESC
+                    LIMIT -1 OFFSET ?
+                )
+            """,
+                (self.max_records,),
+            )
+            conn.commit()
             self._rebuild_running_totals()
-        after = len(self.get_records())
+            after = self.get_record_count()
         return {"removed": before - after, "remaining": after}
+
+    def apply_retention(self, max_age_days: Optional[int] = None) -> None:
+        self.compact(max_age_days=max_age_days)
+
+    def close(self) -> None:
+        """Close this thread's cached connection to release the DB file."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
 
     def get_record_count(self) -> int:
         with self.lock:
-            conn = sqlite3.connect(self.db_path)
-            try:
-                row = conn.execute("SELECT COUNT(*) FROM records").fetchone()
-                return row[0] if row else 0
-            finally:
-                conn.close()
+            conn = self._conn()
+            row = conn.execute("SELECT COUNT(*) FROM records").fetchone()
+            return row[0] if row else 0

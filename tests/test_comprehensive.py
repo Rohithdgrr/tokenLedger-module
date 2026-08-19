@@ -1,11 +1,10 @@
-"""Tests for all remaining features: protocol, tenant_id, verifier plugins, encryption, redaction, audit, dp, retention-JSONL, property tests, integration tests."""
+"""Tests for all remaining features: protocol, tenant_id, verifier plugins, encryption,
+redaction, audit, dp, retention-JSONL, property tests, integration tests."""
 
 import json
 import os
 import tempfile
-from unittest.mock import patch, MagicMock
-
-import pytest
+from unittest.mock import MagicMock
 
 
 class TestStorageBackendProtocol:
@@ -14,15 +13,15 @@ class TestStorageBackendProtocol:
         assert isinstance(MemoryStore(), StorageBackend)
 
     def test_sqlite_store_is_backend(self):
-        from tokenledger.ext.sqlite_store import SqliteStore
         from tokenledger.core.store import StorageBackend
-        import tempfile
+        from tokenledger.ext.sqlite_store import SqliteStore
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             db = f.name
         try:
             store = SqliteStore(db)
             assert isinstance(store, StorageBackend)
         finally:
+            store.close()
             os.unlink(db)
 
 
@@ -88,9 +87,9 @@ class TestVerifierPlugins:
         assert "MY_FLAG" in r["verification"]["anomaly_flags"]
 
     def test_default_rules_exist(self):
-        from tokenledger.core.verifier import VerificationEngine, TokenArithmeticRule, NegativeTokenRule
         from tokenledger.core.pricing import PricingRegistry
         from tokenledger.core.store import MemoryStore
+        from tokenledger.core.verifier import NegativeTokenRule, TokenArithmeticRule, VerificationEngine
         pr = PricingRegistry()
         store = MemoryStore()
         v = VerificationEngine(pr, store)
@@ -101,7 +100,6 @@ class TestVerifierPlugins:
 class TestEncryptionAtRest:
     def test_encrypt_decrypt_roundtrip(self):
         from tokenledger.core.store import MemoryStore
-        import tempfile
         key = b"test-key-123456"
         with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
             path = f.name
@@ -119,7 +117,6 @@ class TestEncryptionAtRest:
 
     def test_encrypted_file_unreadable_without_key(self):
         from tokenledger.core.store import MemoryStore
-        import tempfile
         key = b"test-key-123456"
         with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
             path = f.name
@@ -138,8 +135,9 @@ class TestEncryptionAtRest:
 
 class TestRedactPrompts:
     def test_redact_hashes_prompt_hash(self):
-        from tokenledger import TokenLedger
         import hashlib
+
+        from tokenledger import TokenLedger
         ledger = TokenLedger(redact_prompts=True)
         r = ledger.record_usage("test", "t1", 10, 5, prompt_hash="my-sensitive-prompt")
         assert r["prompt_hash"] != "my-sensitive-prompt"
@@ -156,7 +154,6 @@ class TestRedactPrompts:
 class TestAuditExport:
     def test_export_audit_includes_checksum(self):
         from tokenledger import TokenLedger
-        import tempfile
         ledger = TokenLedger()
         ledger.record_usage("test", "t1", 10, 5)
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
@@ -175,7 +172,6 @@ class TestAuditExport:
 class TestRetentionCleansJSONL:
     def test_retention_rewrites_disk(self):
         from tokenledger.core.store import MemoryStore
-        import tempfile
         with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
             path = f.name
         try:
@@ -215,8 +211,8 @@ class TestDifferentialPrivacy:
 
 class TestPropertyBased:
     def test_checksum_immutability_property(self):
-        from tokenledger.core.store import MemoryStore, _checksum
-        import copy
+
+        from tokenledger.core.store import MemoryStore
         store = MemoryStore()
         r = {"record_id": "r1", "provider": "t", "model": "m", "input_tokens": 10,
              "output_tokens": 5, "total_tokens": 15, "cost_usd": 0.0,

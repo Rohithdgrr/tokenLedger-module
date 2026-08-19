@@ -8,6 +8,9 @@ build/
 .pytest_cache/
 .coverage
 htmlcov/
+.benchmarks/
+.mypy_cache/
+.ruff_cache/
 
 # Environments
 venv/

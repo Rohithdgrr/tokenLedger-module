@@ -3,7 +3,8 @@
 ## Installation
 
 ```bash
-pip install tokenledger
+pip install tokenledger-module        # core (zero hard dependencies)
+pip install "tokenledger-module[all]" # + provider SDKs, CLI (rich), system monitoring
 ```
 
 ## Basic Usage

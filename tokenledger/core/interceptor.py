@@ -1,8 +1,11 @@
 """Method wrapping and monkey-patching for LLM clients."""
 
 import asyncio
+import inspect
 import logging
+import threading
 import time
+from collections.abc import AsyncIterator, Iterator
 from typing import Any, Callable, Optional
 
 from .budget import BudgetEnforcer, BudgetExceededError
@@ -10,12 +13,27 @@ from .estimator import TokenEstimator
 from .extractor import TokenExtractor
 from .pricing import PricingRegistry
 from .record import build_record
-from .store import MemoryStore
+from .store import StorageBackend
 from .verifier import VerificationEngine
 
 logger = logging.getLogger(__name__)
 
 TRACKING_KWARGS = {"user_id", "project_id", "conversation_id", "agent_id", "prompt_hash", "tenant_id"}
+
+TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    ConnectionError,
+    TimeoutError,
+    OSError,
+    asyncio.TimeoutError,
+)
+TRANSIENT_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504}
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """Provider SDKs wrap network errors in their own types; check status codes too."""
+    if isinstance(exc, TRANSIENT_EXCEPTIONS):
+        return True
+    return getattr(exc, "status_code", None) in TRANSIENT_STATUS_CODES
 
 
 class CircuitBreakerOpenError(Exception):
@@ -23,53 +41,100 @@ class CircuitBreakerOpenError(Exception):
 
 
 class TokenBucket:
-    """Token bucket rate limiter."""
+    """Thread-safe token bucket rate limiter."""
 
     def __init__(self, rate: float):
         self.rate = rate
         self.tokens = rate
         self.last = time.monotonic()
+        self.lock = threading.RLock()
 
-    def consume(self) -> None:
+    def _refill(self) -> None:
         now = time.monotonic()
         elapsed = now - self.last
         self.tokens = min(self.rate, self.tokens + elapsed * self.rate)
         self.last = now
-        if self.tokens < 1:
-            sleep = (1 - self.tokens) / self.rate
+
+    def consume(self) -> None:
+        with self.lock:
+            self._refill()
+            if self.tokens < 1:
+                sleep = (1 - self.tokens) / self.rate
+                self.tokens = 0
+                self.last = time.monotonic()
+            else:
+                sleep = 0.0
+                self.tokens -= 1
+        if sleep:
             time.sleep(sleep)
-            self.tokens = 0
-            self.last = time.monotonic()
-        else:
-            self.tokens -= 1
+
+    async def async_consume(self) -> None:
+        with self.lock:
+            self._refill()
+            if self.tokens < 1:
+                sleep = (1 - self.tokens) / self.rate
+                self.tokens = 0
+                self.last = time.monotonic()
+            else:
+                sleep = 0.0
+                self.tokens -= 1
+        if sleep:
+            await asyncio.sleep(sleep)
 
     @property
     def available(self) -> float:
-        now = time.monotonic()
-        elapsed = now - self.last
-        return min(self.rate, self.tokens + elapsed * self.rate)
+        with self.lock:
+            now = time.monotonic()
+            elapsed = now - self.last
+            return min(self.rate, self.tokens + elapsed * self.rate)
 
 
 class StreamWrapper:
-    """Wraps a streaming response to accumulate usage metadata."""
+    """Wraps a streaming response to accumulate usage metadata and text deltas.
 
-    def __init__(self, stream, provider: str):
+    ``__iter__``/``__aiter__`` capture each chunk and run ``on_finish`` once
+    the stream is exhausted, so usage is recorded even when the provider
+    never emitted a final ``usage`` chunk.
+    """
+
+    def __init__(self, stream: Any, provider: str, on_finish: Optional[Callable] = None):
         self._stream = stream
         self._provider = provider
+        self._on_finish = on_finish
         self._chunks: list[Any] = []
+        self._text_parts: list[str] = []
 
-    def __iter__(self):
+    def _capture(self, chunk: Any) -> None:
+        self._chunks.append(chunk)
+        delta = getattr(chunk, "delta", None)
+        if delta is None:
+            delta = getattr(chunk, "text", None)
+        if isinstance(delta, str):
+            self._text_parts.append(delta)
+        else:
+            content = getattr(delta, "content", None)
+            if isinstance(content, str):
+                self._text_parts.append(content)
+
+    def _finalize(self) -> None:
+        cb, self._on_finish = self._on_finish, None
+        if cb:
+            cb()
+
+    def __iter__(self) -> Iterator[Any]:
         for chunk in self._stream:
-            self._chunks.append(chunk)
+            self._capture(chunk)
             yield chunk
+        self._finalize()
 
-    def __aiter__(self):
-        return self._aiter()
-
-    async def _aiter(self):
+    async def __aiter__(self) -> AsyncIterator[Any]:
         async for chunk in self._stream:
-            self._chunks.append(chunk)
+            self._capture(chunk)
             yield chunk
+        self._finalize()
+
+    def get_stream_text(self) -> str:
+        return "".join(self._text_parts)
 
     def get_accumulated_usage(self) -> Optional[dict[str, Any]]:
         for chunk in reversed(self._chunks):
@@ -91,8 +156,8 @@ class InterceptionLayer:
 
     def __init__(
         self,
-        ledger,
-        store: MemoryStore,
+        ledger: Any,
+        store: StorageBackend,
         pricing: PricingRegistry,
         enforcer: BudgetEnforcer,
         extractor: TokenExtractor,
@@ -132,7 +197,7 @@ class InterceptionLayer:
         self._rate_buckets: dict[str, TokenBucket] = {}
         self._provider_config: dict[str, dict[str, Any]] = {}
 
-    def configure_provider(self, provider: str, **kwargs) -> None:
+    def configure_provider(self, provider: str, **kwargs: Any) -> None:
         """Per-provider override for retries, timeout, rate limit, etc."""
         self._provider_config.setdefault(provider, {}).update(kwargs)
 
@@ -144,14 +209,17 @@ class InterceptionLayer:
             kwargs.pop(key, None)
 
     def _make_tracked_fn(self, original: Callable, provider: str) -> Callable:
-        if asyncio.iscoroutinefunction(original):
-            async def tracked(*args, **kwargs):
-                return await self._track_request_async(original, provider, args, kwargs)
-            return tracked
+        if inspect.iscoroutinefunction(original):
 
-        def tracked(*args, **kwargs):
+            async def tracked_async(*args: Any, **kwargs: Any) -> Any:
+                return await self._track_request_async(original, provider, args, kwargs)
+
+            return tracked_async
+
+        def tracked_sync(*args: Any, **kwargs: Any) -> Any:
             return self._track_request(original, provider, args, kwargs)
-        return tracked
+
+        return tracked_sync
 
     def _wrap_attr(self, client: Any, attr_path: str, provider: str) -> Any:
         client_id = id(client)
@@ -176,21 +244,40 @@ class InterceptionLayer:
         return self._wrap_attr(client, "chat.completions.create", "groq")
 
     def wrap_gemini(self, client: Any) -> Any:
-        for attr in ("models.generate_content", "generate_content"):
+        wrapped = False
+        for attr in ("models.generate_content", "generate_content", "models.generate_content_async"):
             try:
-                return self._wrap_attr(client, attr, "google")
+                self._wrap_attr(client, attr, "google")
+                wrapped = True
             except AttributeError:
                 continue
-        logger.warning("wrap_gemini: client has no 'generate_content'; use record_usage() manually")
+        if not wrapped:
+            logger.warning("wrap_gemini: client has no 'generate_content'; use record_usage() manually")
         return client
 
     def wrap_ollama(self, client: Any) -> Any:
-        for attr in ("chat", "generate"):
+        wrapped = False
+        for attr in ("chat", "generate", "achat", "agenerate"):
             try:
-                return self._wrap_attr(client, attr, "ollama")
+                self._wrap_attr(client, attr, "ollama")
+                wrapped = True
             except AttributeError:
                 continue
-        logger.warning("wrap_ollama: client has no 'chat' or 'generate'; use record_usage() manually")
+        if not wrapped:
+            logger.warning("wrap_ollama: client has no 'chat' or 'generate'; use record_usage() manually")
+        return client
+
+    def wrap_cohere(self, client: Any) -> Any:
+        """Wrap the Cohere v2 chat API (``client.v2.chat``) with a fallback to legacy ``client.chat``."""
+        wrapped = False
+        for attr in ("v2.chat", "chat", "v2.chat_stream", "chat_stream"):
+            try:
+                self._wrap_attr(client, attr, "cohere")
+                wrapped = True
+            except AttributeError:
+                continue
+        if not wrapped:
+            logger.warning("wrap_cohere: client has no 'v2.chat' or 'chat'; use record_usage() manually")
         return client
 
     def unwrap(self, client: Any) -> Any:
@@ -254,8 +341,18 @@ class InterceptionLayer:
             self._rate_buckets[provider] = bucket
         bucket.consume()
 
-    def _call_with_retry(self, original: Callable, args: tuple, kwargs: dict[str, Any],
-                     provider: str, timeout: Optional[float] = None) -> Any:
+    async def _check_rate_limit_async(self, provider: str) -> None:
+        bucket = self._rate_buckets.get(provider)
+        if bucket is None:
+            cfg = self._get_provider_config(provider)
+            rps = cfg.get("rate_limit_rps", self.rate_limit_rps)
+            bucket = TokenBucket(rps)
+            self._rate_buckets[provider] = bucket
+        await bucket.async_consume()
+
+    def _call_with_retry(
+        self, original: Callable, args: tuple, kwargs: dict[str, Any], provider: str, timeout: Optional[float] = None
+    ) -> Any:
         self._strip_tracking_kwargs(kwargs)
         cfg = self._get_provider_config(provider)
         max_retries = cfg.get("max_retries", self.max_retries)
@@ -268,18 +365,17 @@ class InterceptionLayer:
                 if req_timeout and attempt == 0:
                     kwargs = {**kwargs, "timeout": req_timeout}
                 return original(*args, **kwargs)
-            except (ConnectionError, TimeoutError, CircuitBreakerOpenError):
-                if attempt < max_retries:
-                    logger.warning("Retry %d/%d for %s", attempt + 1, max_retries, provider)
+            except Exception as e:
+                if attempt < max_retries and _is_transient(e):
+                    logger.warning("Retry %d/%d for %s: %s", attempt + 1, max_retries, provider, e)
                     time.sleep(delay)
                     delay *= 2
                 else:
                     raise
-            except Exception:
-                raise
 
-    async def _call_with_retry_async(self, original: Callable, args: tuple, kwargs: dict[str, Any],
-                                      provider: str, timeout: Optional[float] = None) -> Any:
+    async def _call_with_retry_async(
+        self, original: Callable, args: tuple, kwargs: dict[str, Any], provider: str, timeout: Optional[float] = None
+    ) -> Any:
         self._strip_tracking_kwargs(kwargs)
         cfg = self._get_provider_config(provider)
         max_retries = cfg.get("max_retries", self.max_retries)
@@ -294,15 +390,13 @@ class InterceptionLayer:
                 if req_timeout:
                     return await asyncio.wait_for(original(*args, **kwargs), timeout=req_timeout)
                 return await original(*args, **kwargs)
-            except (ConnectionError, TimeoutError, asyncio.TimeoutError, CircuitBreakerOpenError):
-                if attempt < max_retries:
-                    logger.warning("Async retry %d/%d for %s", attempt + 1, max_retries, provider)
+            except Exception as e:
+                if attempt < max_retries and _is_transient(e):
+                    logger.warning("Async retry %d/%d for %s: %s", attempt + 1, max_retries, provider, e)
                     await asyncio.sleep(delay)
                     delay *= 2
                 else:
                     raise
-            except Exception:
-                raise
 
     def _extract_meta(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -333,23 +427,13 @@ class InterceptionLayer:
                 self.on_budget_exceeded(e)
             raise
 
-    def _record(self, provider: str, metadata: dict[str, Any], messages: list, response: Any, latency_ms: float) -> None:
-        token_data = self.extractor.extract(response, provider)
-        if token_data is None:
-            token_data = self.estimator.estimate(
-                messages=messages, model=metadata["model"], provider=provider,
-            )
-        record = build_record(
-            provider=provider, model=metadata["model"],
-            input_tokens=token_data["input_tokens"], output_tokens=token_data["output_tokens"],
-            user_id=metadata["user_id"], project_id=metadata["project_id"],
-            latency_ms=round(latency_ms, 3), source=token_data.get("source", "api_reported"),
-            pricing=self.pricing, status="success",
-            tenant_id=metadata.get("tenant_id"),
-            conversation_id=metadata.get("conversation_id"),
-            agent_id=metadata.get("agent_id"),
-            prompt_hash=metadata.get("prompt_hash"),
-        )
+    def _apply_prompt_redaction(self, metadata: dict[str, Any], messages: list) -> None:
+        redact = getattr(self.ledger, "redact_prompts", False)
+        if redact and not metadata.get("prompt_hash") and messages:
+            metadata["prompt_hash"] = self.ledger.fingerprint_prompt(messages)
+
+    def _finalize_and_store(self, provider: str, metadata: dict[str, Any], record: dict[str, Any], raw_response: Any = None) -> None:
+        """Shared pipeline: unknown-model policy, ghost, verify, DP, insert, callbacks."""
         if not self.pricing.has_model(provider, metadata["model"]):
             if self.unknown_model_policy == "block":
                 raise UnknownModelError(f"Unknown model: {provider}:{metadata['model']}")
@@ -360,49 +444,96 @@ class InterceptionLayer:
             record["system"] = sysmon.snapshot()
         if self.ghost_mode:
             record["_ghost"] = True
-        record = self.verifier.verify(record, response)
+        record = self.verifier.verify(record, raw_response)
+        if getattr(self.ledger, "differential_privacy_epsilon", None):
+            record = self.ledger._add_noise(record)
         self.store.insert_record(record)
-        self.enforcer.update_model_stats(metadata["model"], token_data["input_tokens"], token_data["output_tokens"])
         if self.on_record:
             self.on_record(record)
 
-    def _handle_stream(self, response: Any, provider: str, metadata: dict[str, Any]) -> Any:
-        wrapped = StreamWrapper(response, provider)
-        original_iter = wrapped.__iter__
-        original_aiter = wrapped.__aiter__
-
-        def tracked_iter():
-            yield from original_iter()
-            usage = wrapped.get_accumulated_usage()
-            if usage:
-                self._record_usage_from_stream(provider, metadata, usage)
-
-        async def tracked_aiter():
-            async for chunk in original_aiter():
-                yield chunk
-            usage = wrapped.get_accumulated_usage()
-            if usage:
-                self._record_usage_from_stream(provider, metadata, usage)
-
-        wrapped.__iter__ = tracked_iter
-        wrapped.__aiter__ = tracked_aiter
-        return wrapped
-
-    def _record_usage_from_stream(self, provider: str, metadata: dict[str, Any], token_data: dict[str, Any]) -> None:
+    def _record(self, provider: str, metadata: dict[str, Any], messages: list, response: Any, latency_ms: float) -> None:
+        self._apply_prompt_redaction(metadata, messages)
+        token_data = self.extractor.extract(response, provider)
+        if token_data is None:
+            token_data = self.estimator.estimate(
+                messages=messages,
+                model=metadata["model"],
+                provider=provider,
+            )
         record = build_record(
-            provider=provider, model=metadata["model"],
-            input_tokens=token_data["input_tokens"], output_tokens=token_data["output_tokens"],
-            user_id=metadata["user_id"], project_id=metadata["project_id"],
-            source="stream", pricing=self.pricing, status="success",
+            provider=provider,
+            model=metadata["model"],
+            input_tokens=token_data["input_tokens"],
+            output_tokens=token_data["output_tokens"],
+            user_id=metadata["user_id"],
+            project_id=metadata["project_id"],
+            latency_ms=round(latency_ms, 3),
+            source=token_data.get("source", "api_reported"),
+            pricing=self.pricing,
+            status="success",
             tenant_id=metadata.get("tenant_id"),
             conversation_id=metadata.get("conversation_id"),
             agent_id=metadata.get("agent_id"),
             prompt_hash=metadata.get("prompt_hash"),
         )
-        if self.ghost_mode:
-            record["_ghost"] = True
-        self.store.insert_record(record)
+        self._finalize_and_store(provider, metadata, record, response)
         self.enforcer.update_model_stats(metadata["model"], token_data["input_tokens"], token_data["output_tokens"])
+
+    def _handle_stream(self, response: Any, provider: str, metadata: dict[str, Any], messages: list, start_time: float) -> Any:
+        def on_finish() -> None:
+            latency = (time.monotonic() - start_time) * 1000
+            self._record_usage_from_stream(
+                provider, metadata, messages,
+                wrapped.get_accumulated_usage(), latency, wrapped.get_stream_text(),
+            )
+
+        wrapped = StreamWrapper(response, provider, on_finish=on_finish)
+        return wrapped
+
+    def _record_usage_from_stream(
+        self,
+        provider: str,
+        metadata: dict[str, Any],
+        messages: list,
+        token_data: Optional[dict[str, Any]],
+        latency_ms: float,
+        stream_text: str = "",
+    ) -> None:
+        self._apply_prompt_redaction(metadata, messages)
+        if not token_data:
+            token_data = self._estimate_stream_usage(provider, metadata["model"], messages, stream_text)
+        record = build_record(
+            provider=provider,
+            model=metadata["model"],
+            input_tokens=token_data["input_tokens"],
+            output_tokens=token_data["output_tokens"],
+            user_id=metadata["user_id"],
+            project_id=metadata["project_id"],
+            latency_ms=round(latency_ms, 3),
+            source="stream",
+            pricing=self.pricing,
+            status="success",
+            tenant_id=metadata.get("tenant_id"),
+            conversation_id=metadata.get("conversation_id"),
+            agent_id=metadata.get("agent_id"),
+            prompt_hash=metadata.get("prompt_hash"),
+        )
+        self._finalize_and_store(provider, metadata, record)
+        self.enforcer.update_model_stats(metadata["model"], token_data["input_tokens"], token_data["output_tokens"])
+
+    def _estimate_stream_usage(self, provider: str, model: str, messages: list, stream_text: str = "") -> dict[str, Any]:
+        """Estimate usage from request messages when the stream never reported usage.
+
+        OpenAI requires ``stream_options={"include_usage": True}`` for usage in
+        streams; other SDKs differ. We fall back to a request-side estimate and
+        measure the output side from the streamed text when available.
+        """
+        return self.estimator.estimate(
+            messages=messages,
+            model=model,
+            provider=provider,
+            output_text=stream_text or None,
+        )
 
     def _track_request(self, original: Callable, provider: str, args: tuple, kwargs: dict[str, Any]) -> Any:
         metadata = self._extract_meta(kwargs)
@@ -420,7 +551,7 @@ class InterceptionLayer:
         self._record_result(provider, True)
 
         if kwargs.get("stream"):
-            return self._handle_stream(response, provider, metadata)
+            return self._handle_stream(response, provider, metadata, kwargs.get("messages", []), start_time)
 
         self._record(provider, metadata, kwargs.get("messages", []), response, latency_ms)
         return response
@@ -429,7 +560,7 @@ class InterceptionLayer:
         metadata = self._extract_meta(kwargs)
         self._budget_check(metadata, provider, kwargs)
         self._check_circuit(provider)
-        self._check_rate_limit(provider)
+        await self._check_rate_limit_async(provider)
         start_time = time.monotonic()
         try:
             response = await self._call_with_retry_async(original, args, kwargs, provider, self.request_timeout)
@@ -441,18 +572,21 @@ class InterceptionLayer:
         self._record_result(provider, True)
 
         if kwargs.get("stream"):
-            return self._handle_stream(response, provider, metadata)
+            return self._handle_stream(response, provider, metadata, kwargs.get("messages", []), start_time)
 
         self._record(provider, metadata, kwargs.get("messages", []), response, latency_ms)
         return response
 
     def _log_blocked_attempt(self, metadata: dict[str, Any], provider: str) -> None:
         record = build_record(
-            provider=provider, model=metadata.get("model", "unknown"),
-            input_tokens=0, output_tokens=0,
+            provider=provider,
+            model=metadata.get("model", "unknown"),
+            input_tokens=0,
+            output_tokens=0,
             user_id=metadata.get("user_id", "anonymous"),
             project_id=metadata.get("project_id", "default"),
-            source="budget_blocked", status="blocked",
+            source="budget_blocked",
+            status="blocked",
             tenant_id=metadata.get("tenant_id"),
         )
         self.store.insert_record(record)

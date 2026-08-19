@@ -3,10 +3,10 @@ Analytics and aggregation engine.
 Pure Python queries with O(1) lookups via running totals.
 """
 
-from collections import Counter, defaultdict
+from collections import Counter
 from typing import Any, Optional
 
-from .store import MemoryStore
+from .store import StorageBackend
 
 
 class AnalyticsEngine:
@@ -15,21 +15,28 @@ class AnalyticsEngine:
     Uses pre-computed running totals for O(1) common queries.
     """
 
-    def __init__(self, store: MemoryStore):
+    def __init__(self, store: StorageBackend):
         self.store = store
 
-    def get_summary(self, scope: str = "global", scope_id: str = "all") -> dict[str, Any]:
-        """Get summary statistics with budget utilization, top models, and anomalies."""
+    def get_summary(
+        self,
+        scope: str = "global",
+        scope_id: str = "all",
+        top_k: int = 5,
+    ) -> dict[str, Any]:
+        """Get summary statistics with budget utilization, top models, and anomalies.
+
+        Top models/providers are read from the store's running totals (O(1),
+        no record scan) so ghost/blocked records never leak into rankings.
+        """
         base = self.store.get_running_totals(scope, scope_id)
-        records = self.store.get_records()
         budgets = self.store.get_all_budgets()
 
         base["budget_count"] = len(budgets)
 
         budget_utilization = {}
         for bk, b in budgets.items():
-            f"{b.get('scope','global')}:{b.get('scope_id','all')}"
-            spend = self.store.get_running_totals(b.get('scope','global'), b.get('scope_id','all'))
+            spend = self.store.get_running_totals(b.get('scope', 'global'), b.get('scope_id', 'all'))
             limit = b.get("limit_usd", 0)
             budget_utilization[bk] = {
                 "spend": round(spend.get("cost_usd", 0), 6),
@@ -38,20 +45,29 @@ class AnalyticsEngine:
             }
         base["budget_utilization"] = budget_utilization
 
-        model_totals: dict[str, int] = defaultdict(int)
-        provider_totals: dict[str, int] = defaultdict(int)
-        status_counts: Counter = Counter()
-        for r in records:
-            model_totals[r.get("model", "unknown")] += r.get("total_tokens", 0)
-            provider_totals[r.get("provider", "unknown")] += r.get("total_tokens", 0)
-            status_counts[r.get("status", "success")] += 1
+        running = self.store.running_totals
+        model_aggs = [
+            {"model": key[len("model:"):], **agg}
+            for key, agg in running.items()
+            if key.startswith("model:")
+        ]
+        provider_aggs = [
+            {"provider": key[len("provider:"):], **agg}
+            for key, agg in running.items()
+            if key.startswith("provider:")
+        ]
+        base["top_models"] = [
+            {"model": m["model"], "tokens": m["total_tokens"]}
+            for m in sorted(model_aggs, key=lambda x: -x["total_tokens"])[:top_k]
+        ]
+        base["top_providers"] = [
+            {"provider": p["provider"], "tokens": p["total_tokens"]}
+            for p in sorted(provider_aggs, key=lambda x: -x["total_tokens"])[:top_k]
+        ]
 
-        top_models = sorted(model_totals.items(), key=lambda x: -x[1])[:5]
-        base["top_models"] = [{"model": m, "tokens": t} for m, t in top_models]
-        base["top_providers"] = sorted(
-            [{"provider": p, "tokens": t} for p, t in provider_totals.items()],
-            key=lambda x: -x["tokens"],
-        )[:5]
+        status_counts: Counter = Counter()
+        for r in self.store.get_records():
+            status_counts[r.get("status", "success")] += 1
         base["status_breakdown"] = dict(status_counts)
 
         status_counts.pop("success", None)
@@ -205,17 +221,19 @@ class AnalyticsEngine:
         if dimension == "global":
             return True
         if dimension == "provider":
-            return record.get("provider") == dimension_id
+            return bool(record.get("provider") == dimension_id)
         if dimension == "model":
-            return record.get("model") == dimension_id
+            return bool(record.get("model") == dimension_id)
         if dimension == "user":
-            return record.get("user_id", "anonymous") == dimension_id
+            return bool(record.get("user_id", "anonymous") == dimension_id)
         if dimension == "project":
-            return record.get("project_id", "default") == dimension_id
+            return bool(record.get("project_id", "default") == dimension_id)
         if dimension == "conversation":
-            return record.get("conversation_id") == dimension_id
+            return bool(record.get("conversation_id") == dimension_id)
         if dimension == "agent":
-            return record.get("agent_id") == dimension_id
+            return bool(record.get("agent_id") == dimension_id)
+        if dimension == "tenant":
+            return bool(record.get("tenant_id") == dimension_id)
         return False
 
     def _matches_budget_scope(self, record: dict[str, Any], budget: dict[str, Any]) -> bool:
@@ -225,12 +243,18 @@ class AnalyticsEngine:
 
         if scope == "global":
             return True
+        if scope == "provider":
+            return bool(record.get("provider") == scope_id)
+        if scope == "model":
+            return bool(record.get("model") == scope_id)
         if scope == "project":
-            return record.get("project_id", "default") == scope_id
+            return bool(record.get("project_id", "default") == scope_id)
         if scope == "user":
-            return record.get("user_id", "anonymous") == scope_id
+            return bool(record.get("user_id", "anonymous") == scope_id)
+        if scope == "tenant":
+            return bool(record.get("tenant_id") == scope_id)
         if scope == "user_project":
             parts = scope_id.split(":")
             if len(parts) == 2:
-                return record.get("user_id") == parts[0] and record.get("project_id") == parts[1]
+                return bool(record.get("user_id") == parts[0] and record.get("project_id") == parts[1])
         return False
