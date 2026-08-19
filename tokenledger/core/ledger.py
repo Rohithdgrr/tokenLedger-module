@@ -294,8 +294,6 @@ class TokenLedger:
             record["system"] = self.system_monitor.snapshot()
 
         verified = self.verifier.verify(record)
-        if self.differential_privacy_epsilon:
-            verified = self._add_noise(verified)
 
         self.store.insert_record(verified)
         if self.interceptor.on_record:
@@ -303,7 +301,13 @@ class TokenLedger:
         return verified
 
     def _add_noise(self, record: dict[str, Any]) -> dict[str, Any]:
-        """Add Laplace noise (epsilon-DP) to token/cost fields in the record."""
+        """Add Laplace noise (epsilon-DP) to token/cost fields in the record.
+
+        Applied only at the export/query boundary (on record copies), never at
+        insert time, so internal math (budgets, running totals, analytics)
+        stays exact. ``total_tokens`` is recomputed after noise so the
+        arithmetic invariant always holds.
+        """
         eps = self.differential_privacy_epsilon or 1.0
         scale = 1.0 / eps
         record["input_tokens"] = max(0, int(record.get("input_tokens", 0) + self._laplace_sample(scale)))
@@ -312,6 +316,12 @@ class TokenLedger:
         record["cost_usd"] = max(0.0, record.get("cost_usd", 0) + self._laplace_sample(scale * 0.001))
         record["_dp_noise_applied"] = True
         return record
+
+    def _dp_records(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Return noise-applied copies when differential privacy is enabled."""
+        if not self.differential_privacy_epsilon:
+            return records
+        return [self._add_noise(dict(r)) for r in records]
 
     @staticmethod
     def _laplace_sample(scale: float) -> float:
@@ -325,8 +335,9 @@ class TokenLedger:
             return scale * math.log(2 * u)
         return -scale * math.log(2 * (1 - u))
 
-    def get_records(self) -> list[dict[str, Any]]:
-        return self.store.get_records()
+    def get_records(self, apply_dp: bool = False) -> list[dict[str, Any]]:
+        records = self.store.get_records()
+        return self._dp_records(records) if apply_dp else records
 
     def set_budget(self, scope: str, scope_id: str, limit_usd: float, reset_cycle: str = "monthly") -> None:
         self.store.set_budget(scope, scope_id, {"scope": scope, "scope_id": scope_id, "limit_usd": limit_usd, "reset_cycle": reset_cycle})
@@ -340,18 +351,20 @@ class TokenLedger:
     def get_spending_by_dimension(self, dimension: str) -> list[dict[str, Any]]:
         return self.analytics.get_spending_by_dimension(dimension)
 
-    def export_csv(self, filepath: str) -> None:
-        self.exporter.export_csv(filepath, self.get_records())
+    def export_csv(self, filepath: str, apply_dp: bool = False) -> None:
+        self.exporter.export_csv(filepath, self.get_records(apply_dp=apply_dp))
 
-    def export_json(self, filepath: str) -> None:
-        self.exporter.export_json(filepath, self.get_records())
+    def export_json(self, filepath: str, apply_dp: bool = False) -> None:
+        self.exporter.export_json(filepath, self.get_records(apply_dp=apply_dp))
 
-    def export_audit_json(self, filepath: str | None = None) -> dict[str, Any]:
+    def export_audit_json(self, filepath: str | None = None, apply_dp: bool = False) -> dict[str, Any]:
         """Export with verification status and checksums.
 
         Returns the audit bundle; writes it to ``filepath`` when provided.
+        ``apply_dp`` applies differential privacy noise to exported copies
+        when epsilon is configured.
         """
-        records = self.get_records()
+        records = self.get_records(apply_dp=apply_dp)
         audit = {
             "exported_at": datetime.now(timezone.utc).isoformat(),
             "record_count": len(records),

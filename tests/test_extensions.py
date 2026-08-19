@@ -705,8 +705,35 @@ class TestP2Fixes:
         list(wrapped)
         records = ledger.get_records()
         assert len(records) == 1
-        assert records[0]["source"] == "stream"
+        assert records[0]["source"] == "stream_fallback_estimated"
         assert records[0]["output_tokens"] > 0  # estimated from streamed delta text
+
+    def test_stream_fallback_flagged_estimated(self):
+        import time
+
+        from tokenledger import TokenLedger
+        ledger = TokenLedger()
+
+        class FakeChunk:
+            def __init__(self, text):
+                self.delta = text
+
+        class FakeStream:
+            def __iter__(self):
+                yield FakeChunk("Hello ")
+                yield FakeChunk("world")
+
+        metadata = {
+            "user_id": "u1", "project_id": "p1", "model": "gpt-4o",
+            "conversation_id": None, "agent_id": None, "prompt_hash": None, "tenant_id": None,
+        }
+        wrapped = ledger.interceptor._handle_stream(
+            FakeStream(), "openai", metadata, [{"role": "user", "content": "hi"}], time.monotonic()
+        )
+        list(wrapped)
+        records = ledger.get_records()
+        assert len(records) == 1
+        assert records[0]["source"] == "stream_fallback_estimated"
 
     # ── H6: retry / transient detection ───────────────────────────────
 
@@ -1134,7 +1161,7 @@ class TestCoverageGaps:
         asyncio.run(drain())
         records = ledger.get_records()
         assert len(records) == 1
-        assert records[0]["source"] == "stream"
+        assert records[0]["source"] == "stream_fallback_estimated"
         assert records[0]["output_tokens"] > 0
 
     def test_circuit_breaker_opens_half_opens_and_health(self):
@@ -1258,7 +1285,8 @@ class TestCoverageGaps:
             {"model": "gpt-4o", "messages": [{"role": "user", "content": "secret prompt"}], "user_id": "u1"},
         )
         stored = dp.get_records()[-1]
-        assert stored["_dp_noise_applied"] is True
+        assert stored.get("_dp_noise_applied") is None
+        assert dp.get_records(apply_dp=True)[-1]["_dp_noise_applied"] is True
         assert stored["prompt_hash"]
 
     def test_on_record_callback_and_unwrap(self):

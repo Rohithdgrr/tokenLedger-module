@@ -2,6 +2,7 @@
 
 import abc
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -10,7 +11,7 @@ import os
 import threading
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,26 @@ _MAGIC = b"TLDGR1\0"
 _MAGIC_LEN = len(_MAGIC)
 _MAC_LEN = 32  # sha256
 
+_FERNET_CLS: Any = None  # lazy probe: None = unchecked, False = cryptography unavailable
+
+
+def _fernet(key: bytes) -> Optional[Any]:
+    """Return a Fernet (AES-128-CBC + HMAC) cipher, or None if `cryptography` is missing.
+
+    Imported lazily to keep process startup fast and the core dependency-free.
+    """
+    global _FERNET_CLS
+    if _FERNET_CLS is None:
+        try:
+            from cryptography.fernet import Fernet
+
+            _FERNET_CLS = Fernet
+        except ImportError:  # pragma: no cover
+            _FERNET_CLS = False
+    if _FERNET_CLS:
+        return _FERNET_CLS(base64.urlsafe_b64encode(key))
+    return None
+
 
 def _normalize_key(key: "str | bytes") -> bytes:
     """Normalize a str or bytes encryption key to a fixed 32-byte SHA-256 digest."""
@@ -92,28 +113,40 @@ def _xor(data: bytes, key: bytes) -> bytes:
 
 
 def _encrypt(data: bytes, key: bytes) -> bytes:
-    """Obfuscate bytes with a magic header + HMAC-SHA256 authenticity tag.
+    """Encrypt bytes with Fernet (AES-128-CBC + HMAC) when `cryptography` is installed.
 
-    Note: XOR is obfuscation only, NOT real encryption. The HMAC detects
-    tampering and wrong keys, but anyone with the key visible in the process
-    can recover the data. Do not use for secrets or compliance-grade at rest.
+    Falls back to XOR + HMAC-SHA256 obfuscation when it is not — useful for
+    casual privacy only, never for secrets or compliance-grade at-rest data.
     """
-    cipher = _xor(data, key)
-    mac = hmac.new(key, cipher, hashlib.sha256).digest()
-    return _MAGIC + mac + cipher
+    cipher = _fernet(key)
+    if cipher is not None:
+        return cast(bytes, cipher.encrypt(data))
+    blob = _xor(data, key)
+    mac = hmac.new(key, blob, hashlib.sha256).digest()
+    return _MAGIC + mac + blob
 
 
 def _decrypt(raw: bytes, key: bytes) -> Optional[bytes]:
-    """Reverse :func:`_encrypt`; returns None on wrong key or tampered data."""
+    """Reverse :func:`_encrypt`; returns None on wrong key or tampered data.
+
+    Fernet tokens are tried first; legacy XOR blobs (magic-prefixed) and
+    plaintext files are still readable for back-compatibility.
+    """
+    cipher = _fernet(key)
+    if cipher is not None:
+        try:
+            return cast(bytes, cipher.decrypt(raw))
+        except Exception:
+            pass  # nosec B110: not a Fernet token — fall through to legacy XOR/plaintext
     if raw.startswith(_MAGIC):
         body = raw[_MAGIC_LEN:]
         if len(body) < _MAC_LEN:
             return None
-        mac, cipher = body[:_MAC_LEN], body[_MAC_LEN:]
-        expected = hmac.new(key, cipher, hashlib.sha256).digest()
+        mac, blob = body[:_MAC_LEN], body[_MAC_LEN:]
+        expected = hmac.new(key, blob, hashlib.sha256).digest()
         if not hmac.compare_digest(mac, expected):
             return None
-        return _xor(cipher, key)
+        return _xor(blob, key)
     return raw  # legacy plaintext / old XOR-only blob — left as-is
 
 
@@ -157,11 +190,11 @@ class MemoryStore(StorageBackend):
             ("project", record.get("project_id", "default")),
             ("month", record.get("timestamp", "")[:7]),
         ]
-        if record.get("conversation_id"):
+        if record.get("conversation_id") and str(record["conversation_id"]).strip():
             dimensions.append(("conversation", record["conversation_id"]))
-        if record.get("agent_id"):
+        if record.get("agent_id") and str(record["agent_id"]).strip():
             dimensions.append(("agent", record["agent_id"]))
-        if record.get("tenant_id"):
+        if record.get("tenant_id") and str(record["tenant_id"]).strip():
             dimensions.append(("tenant", record["tenant_id"]))
         for scope, scope_id in dimensions:
             key = f"{scope}:{scope_id}"

@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.4.0 (2026-08-19)
+
+- **Real encryption-at-rest**: `encryption_key` now uses Fernet (AES-128-CBC + HMAC) when `cryptography` is installed — new `[security]` extra (`pip install "tokenledger-module[security]"`); HMAC-tagged XOR remains only as the no-dependency fallback, and legacy XOR files still load. Import is lazy (startup stays fast), docs updated (README, docs/)
+- **DP moved to the boundary**: Laplace noise is no longer applied at insert time — stored records, budgets, running totals, and analytics are always exact. `get_records(apply_dp=True)`, `export_csv/json(apply_dp=True)`, and `export_audit_json(apply_dp=True)` apply noise to copies; `total_tokens = input + output` holds in both paths
+- **No silent $0 pricing**: unknown models fall back to the bundled default rate and log a `WARNING`; the degenerate $0 branch also warns
+- **Stream fallback explicitly flagged**: records built from estimation after a stream lacked usage are marked `source: "stream_fallback_estimated"` instead of `"stream"`
+- **SQLite**: explicit `PRAGMA busy_timeout=5000` on all connections (WAL already enabled)
+- **Bandit clean (0 findings)**: webhook URLs restricted to http(s) schemes, `# nosec` justifications on fixed-argv system probes and parameterized SQL, silent `pass` paths removed
+- **Docs**: README gains a Security Policy section; Known Limitations expanded (running-totals growth semantics, SQLite WAL/busy timeout)
+
+## v1.3.3 (2026-08-19)
+
+- **No junk dimension keys from blank IDs**: whitespace-only `conversation_id`/`agent_id`/`tenant_id` no longer create dimension entries in `running_totals` (e.g. `"tenant:  "`); regression test added
+
+## v1.3.2 (2026-08-19)
+
+- **Stream records no longer lost on interruption**: `StreamWrapper.__iter__`/`__aiter__` wrap the chunk loop in `try/finally`, so `_finalize()` fires on consumer `break`, exceptions, and `GeneratorExit` — usage is recorded even when the stream ends abnormally
+- Regression tests: sync + async early-break both finalize exactly once
+
 ## v1.3.1 (2026-08-19)
 
 - **Streaming usage now always recorded**: `StreamWrapper` is callback-based (`__iter__`/`__aiter__` can't be monkey-patched per-instance); fallback estimation measures output from streamed text instead of inventing tokens; async stream path covered end-to-end

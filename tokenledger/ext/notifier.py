@@ -4,9 +4,17 @@ import json
 import logging
 from typing import Any, Optional
 from urllib.error import URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
+
+_HTTP_SCHEMES = ("http", "https")
+
+
+def _validate_http_url(url: str, what: str) -> None:
+    if urlparse(url).scheme not in _HTTP_SCHEMES:
+        raise ValueError(f"{what} must be an http(s) URL, got: {url}")
 
 
 class WebhookNotifier:
@@ -27,6 +35,10 @@ class WebhookNotifier:
         self.slack_url = slack_url
         self.generic_url = generic_url
         self.timeout = timeout
+        if slack_url:
+            _validate_http_url(slack_url, "slack_url")
+        if generic_url:
+            _validate_http_url(generic_url, "generic_url")
 
     def _post(self, payload: dict) -> None:
         if self.slack_url:
@@ -39,7 +51,7 @@ class WebhookNotifier:
         try:
             req = Request(self.slack_url, data=body, method="POST")
             req.add_header("Content-Type", "application/json")
-            with urlopen(req, timeout=self.timeout) as resp:
+            with urlopen(req, timeout=self.timeout) as resp:  # nosec B310: scheme restricted to http(s) in __init__
                 if resp.status != 200:
                     logger.warning("Slack webhook returned %s", resp.status)
         except URLError as e:
@@ -50,7 +62,7 @@ class WebhookNotifier:
         try:
             req = Request(self.generic_url, data=body, method="POST")
             req.add_header("Content-Type", "application/json")
-            with urlopen(req, timeout=self.timeout) as resp:
+            with urlopen(req, timeout=self.timeout) as resp:  # nosec B310: scheme restricted to http(s) in __init__
                 if resp.status >= 400:
                     logger.warning("Generic webhook returned %s", resp.status)
         except URLError as e:

@@ -43,6 +43,16 @@ class TestMultiTenant:
         totals = ledger.store.get_running_totals("tenant", "acme")
         assert totals["requests"] == 1
 
+    def test_blank_dimensions_not_aggregated(self):
+        from tokenledger import TokenLedger
+        ledger = TokenLedger()
+        ledger.record_usage("test", "t1", 10, 5, tenant_id="   ", conversation_id="", agent_id="  ")
+        assert ledger.store.get_running_totals("tenant", "   ") == {
+            "requests": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0,
+        }
+        assert ledger.store.get_running_totals("conversation", "")["requests"] == 0
+        assert ledger.store.get_running_totals("agent", "  ")["requests"] == 0
+
     def test_get_spending_by_tenant(self):
         from tokenledger import TokenLedger
         ledger = TokenLedger()
@@ -132,6 +142,81 @@ class TestEncryptionAtRest:
         finally:
             os.unlink(path)
 
+    def test_fernet_writes_no_plaintext_magic(self):
+        from tokenledger.core import store as store_mod
+        with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
+            path = f.name
+        try:
+            store = store_mod.MemoryStore(persist_path=path, encryption_key="test-key")
+            store.insert_record({"record_id": "r1", "provider": "t", "model": "m",
+                                  "input_tokens": 1, "output_tokens": 1,
+                                  "total_tokens": 2, "cost_usd": 0.0,
+                                  "timestamp": "2026-07-26T00:00:00"})
+            with open(path, "rb") as f:
+                raw = f.read()
+            assert store_mod._fernet(store.encryption_key) is not None  # cryptography available
+            assert not raw.startswith(store_mod._MAGIC)
+            assert b"record_id" not in raw
+        finally:
+            os.unlink(path)
+
+    def test_xor_fallback_roundtrip(self, monkeypatch):
+        from tokenledger.core import store as store_mod
+        monkeypatch.setattr(store_mod, "_FERNET_CLS", False)
+        with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
+            path = f.name
+        try:
+            store = store_mod.MemoryStore(persist_path=path, encryption_key="test-key")
+            store.insert_record({"record_id": "r1", "provider": "t", "model": "m",
+                                  "input_tokens": 1, "output_tokens": 1,
+                                  "total_tokens": 2, "cost_usd": 0.0,
+                                  "timestamp": "2026-07-26T00:00:00"})
+            with open(path, "rb") as f:
+                raw = f.read()
+            assert raw.startswith(store_mod._MAGIC)
+            store2 = store_mod.MemoryStore(persist_path=path, encryption_key="test-key")
+            assert store2.get_record_count() == 1
+        finally:
+            os.unlink(path)
+
+    def test_legacy_xor_file_readable_with_fernet(self, monkeypatch):
+        from tokenledger.core import store as store_mod
+        monkeypatch.setattr(store_mod, "_FERNET_CLS", False)
+        with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
+            path = f.name
+        try:
+            store = store_mod.MemoryStore(persist_path=path, encryption_key="test-key")
+            store.insert_record({"record_id": "r1", "provider": "t", "model": "m",
+                                  "input_tokens": 1, "output_tokens": 1,
+                                  "total_tokens": 2, "cost_usd": 0.0,
+                                  "timestamp": "2026-07-26T00:00:00"})
+        finally:
+            pass
+        try:
+            store2 = store_mod.MemoryStore(persist_path=path, encryption_key="test-key")
+            assert store2.get_record_count() == 1
+        finally:
+            os.unlink(path)
+
+    def test_notifier_rejects_non_http_urls(self):
+        import pytest
+
+        from tokenledger.ext.notifier import WebhookNotifier
+        with pytest.raises(ValueError):
+            WebhookNotifier(slack_url="file:///etc/passwd")
+        with pytest.raises(ValueError):
+            WebhookNotifier(generic_url="ftp://example.com/hook")
+
+    def test_unknown_model_pricing_warns(self, caplog):
+        import logging
+
+        from tokenledger.core.pricing import PricingRegistry
+        registry = PricingRegistry()
+        with caplog.at_level(logging.WARNING, logger="tokenledger.core.pricing"):
+            pricing = registry.get_pricing("openai", "no-such-model")
+        assert pricing["input_per_token"] > 0  # safe default, never $0
+        assert any("Unknown model" in r.message for r in caplog.records)
+
 
 class TestRedactPrompts:
     def test_redact_hashes_prompt_hash(self):
@@ -188,25 +273,40 @@ class TestRetentionCleansJSONL:
 
 
 class TestDifferentialPrivacy:
-    def test_dp_adds_noise_flag(self):
+    def test_dp_applied_only_at_export(self):
         from tokenledger import TokenLedger
         ledger = TokenLedger(differential_privacy_epsilon=1.0)
-        r = ledger.record_usage("test", "t1", 100, 50)
-        assert r.get("_dp_noise_applied") is True
+        stored = ledger.record_usage("test", "t1", 100, 50)
+        assert stored.get("_dp_noise_applied") is None
+        noisy = ledger.get_records(apply_dp=True)
+        assert noisy[-1]["_dp_noise_applied"] is True
+        assert noisy[-1] is not stored
 
-    def test_dp_noise_changes_values(self):
+    def test_dp_export_keeps_arithmetic_invariant(self):
         from tokenledger import TokenLedger
         ledger = TokenLedger(differential_privacy_epsilon=0.1)
-        r = ledger.record_usage("test", "t1", 1000, 500)
-        # Values should be different (noisy)
-        assert r["input_tokens"] >= 0
-        assert r["output_tokens"] >= 0
+        for _ in range(5):
+            ledger.record_usage("test", "t1", 1000, 500)
+        for record in ledger.get_records(apply_dp=True):
+            assert record["_dp_noise_applied"] is True
+            assert record["total_tokens"] == record["input_tokens"] + record["output_tokens"]
 
     def test_dp_disabled_by_default(self):
         from tokenledger import TokenLedger
         ledger = TokenLedger()
         r = ledger.record_usage("test", "t1", 100, 50)
         assert r.get("_dp_noise_applied") is None
+        assert ledger.get_records(apply_dp=True)[-1].get("_dp_noise_applied") is None
+
+    def test_dp_export_does_not_mutate_stored_records(self):
+        from tokenledger import TokenLedger
+        ledger = TokenLedger(differential_privacy_epsilon=0.5)
+        ledger.record_usage("test", "t1", 1000, 500)
+        before = ledger.get_records()[0]["input_tokens"]
+        bundle = ledger.export_audit_json(apply_dp=True)
+        assert bundle["records"][0]["_dp_noise_applied"] is True
+        assert ledger.get_records()[0]["input_tokens"] == before
+        assert ledger.get_records()[0].get("_dp_noise_applied") is None
 
 
 class TestPropertyBased:

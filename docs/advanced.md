@@ -45,10 +45,12 @@ ledger = TokenLedger(
 )
 ```
 
-All persisted JSONL data is XOR-obfuscated and HMAC-tagged. Files written with
-a key are unreadable without it (wrong or missing keys fail with a warning and
-load zero records), but XOR is **not** strong encryption — it is casual
-privacy only, not suitable for compliance-grade secrets.
+All persisted JSONL data is encrypted with Fernet (AES-128-CBC + HMAC) when the
+`cryptography` package is installed (`pip install "tokenledger-module[security]"`).
+Without it, files are XOR-obfuscated and HMAC-tagged — a casual-privacy fallback,
+**not** encryption, and not suitable for compliance-grade secrets. Files written
+with a key are unreadable without it (wrong or missing keys fail with a warning
+and load zero records).
 
 ## Prompt Redaction
 
@@ -62,7 +64,9 @@ ledger = TokenLedger(redact_prompts=True)
 
 ```python
 ledger = TokenLedger(differential_privacy_epsilon=1.0)
-# Laplace noise added to input_tokens, output_tokens, cost_usd
+noisy = ledger.get_records(apply_dp=True)          # Laplace noise on copies
+bundle = ledger.export_audit_json(apply_dp=True)   # or on any export
+# stored records, budgets, and analytics always use exact figures
 # Lower epsilon = more privacy, less accuracy
 ```
 

@@ -34,6 +34,7 @@ class SqliteStore(StorageBackend):
         if conn is None:
             conn = sqlite3.connect(self.db_path)
             conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
             self._local.conn = conn
         return conn
 
@@ -42,6 +43,7 @@ class SqliteStore(StorageBackend):
             conn = sqlite3.connect(self.db_path)
             try:
                 conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA busy_timeout=5000")
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS records (
                         record_id TEXT PRIMARY KEY,
@@ -178,7 +180,7 @@ class SqliteStore(StorageBackend):
         with self.lock:
             conn = self._conn()
             cursor = conn.execute(
-                "SELECT * FROM records ORDER BY timestamp" + (" LIMIT ?" if limit else ""),
+                "SELECT * FROM records ORDER BY timestamp" + (" LIMIT ?" if limit else ""),  # nosec B608: constant fragment, values parameterized
                 (limit,) if limit else (),
             )
             rows = []

@@ -51,7 +51,7 @@ def detect_provider_from_messages(messages: Any) -> str | None:
             if check(messages):
                 return provider
         except Exception:
-            continue
+            continue  # nosec B112: malformed messages shouldn't abort detection
     return None
 
 

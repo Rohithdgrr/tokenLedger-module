@@ -24,9 +24,9 @@ The package works by **wrapping LLM API calls**. When a request is made, TokenLe
 - **CLI** — `tokenledger summary|export|verify|compact|health|update-pricing` from the terminal.
 - **SQLite Storage** — Optional SQLite backend via `TokenLedger(store=SqliteStore("usage.db"))`.
 - **Multi-Tenant** — `tenant_id` dimension for isolating usage across organizations or environments.
-- **Obfuscation-at-Rest** — HMAC-tagged XOR obfuscation for persisted JSONL via an `encryption_key` (casual privacy, not strong encryption).
+- **Encryption-at-Rest** — Persisted JSONL is encrypted with Fernet (AES-128-CBC + HMAC) via `encryption_key` when `cryptography` is installed; falls back to HMAC-tagged XOR obfuscation otherwise.
 - **Prompt Redaction** — `redact_prompts=True` hashes prompt content before recording.
-- **Differential Privacy** — Laplace noise injection via `differential_privacy_epsilon` parameter.
+- **Differential Privacy** — Laplace noise via `differential_privacy_epsilon`, applied only at the export/query boundary so internal budgets and analytics stay exact.
 - **Audit Export** — `export_audit_json()` wraps records in a signed envelope with checksum.
 - **@ledger.track Decorator** — `@ledger.track(provider="openai", model="gpt-4")` records any function.
 - **Zero Database** — Everything runs in-memory. Optional append-only JSONL file for cross-session durability.
@@ -45,6 +45,7 @@ The package works by **wrapping LLM API calls**. When a request is made, TokenLe
 pip install tokenledger-module        # core (zero hard dependencies)
 pip install "tokenledger-module[all]" # + provider SDKs, CLI (rich), system monitoring
 pip install "tokenledger-module[cli]" # CLI pretty-printing (rich)
+pip install "tokenledger-module[security]" # Fernet AES-128 encryption-at-rest
 ```
 
 The import and CLI names are `tokenledger`:
@@ -329,7 +330,9 @@ ledger = TokenLedger(redact_prompts=True)
 
 ```python
 ledger = TokenLedger(differential_privacy_epsilon=1.0)
-# Laplace noise added to token/cost fields in memory
+noisy = ledger.get_records(apply_dp=True)      # noise applied to copies
+bundle = ledger.export_audit_json(apply_dp=True)  # or on any export
+# stored records, budgets, and analytics stay exact
 ```
 
 ### Audit Export
@@ -430,9 +433,9 @@ tokenledger/
 | `retention_days` | `int` | `90` | Max age in days before auto-purge |
 | `store` | `StorageBackend` | `MemoryStore()` | Storage backend (SQLite via `SqliteStore`) |
 | `tenant_id` | `str` | `None` | Isolate usage records by tenant |
-| `encryption_key` | `str`/`bytes` | `None` | XOR+HMAC obfuscation key for JSONL-at-rest (casual privacy, not encryption) |
+| `encryption_key` | `str`/`bytes` | `None` | Fernet AES-128-CBC encryption for JSONL-at-rest (XOR+HMAC fallback without `cryptography`) |
 | `redact_prompts` | `bool` | `False` | Hash prompt content before recording |
-| `differential_privacy_epsilon` | `float` | `None` | Laplace noise scale (lower = more privacy) |
+| `differential_privacy_epsilon` | `float` | `None` | Laplace noise scale applied at export/query (lower = more privacy) |
 | `on_budget_exceeded` | `callable` | `None` | Callback fired when a budget is exceeded |
 | `on_budget_threshold` | `callable` | `None` | Callback fired at configurable utilization threshold |
 
@@ -449,15 +452,23 @@ Interceptor configuration (set after init):
 
 ---
 
+## Security Policy
+
+- **Encryption-at-rest**: Persisted JSONL encrypted with `encryption_key` uses **Fernet (AES-128-CBC + HMAC)** when the `cryptography` package is installed (`pip install "tokenledger-module[security]"`). Without it, the fallback is HMAC-tagged XOR — obfuscation only, **not** encryption. For compliance-grade at-rest protection, install the `security` extra.
+- **No secrets in logs**: API keys and prompts are never logged. Prompt content is SHA-256 hashed when `redact_prompts=True`.
+- **Differential privacy**: Laplace noise (`differential_privacy_epsilon`) is applied **only at the export/query boundary** (`get_records(apply_dp=True)`, `export_*`, `export_audit_json`) — internal budgets, running totals, and analytics always use exact figures.
+- **Unknown models**: Never priced at $0. Unknown models fall back to the bundled default rate and log a `WARNING`; `unknown_model_policy="block"` rejects them outright.
+- **Reporting vulnerabilities**: Open an issue at [GitHub Issues](https://github.com/Rohithdgrr/tokenLedger-module/issues).
+
 ## Known Limitations
 
 - **Pricing drift**: Built-in rates are a snapshot. Monitor provider pricing pages and use `register_pricing()` to update, or load from an external JSON file.
-- **Estimation accuracy**: When APIs don't report token usage, `tiktoken` (>98%) or character heuristic (~85%) fallbacks are used. Records from fallbacks are flagged `source: "estimated"`.
+- **Estimation accuracy**: When APIs don't report token usage, `tiktoken` (>98%) or character heuristic (~85%) fallbacks are used. Records from fallbacks are flagged `source: "estimated"` (streams: `"stream_fallback_estimated"`).
 - **Gemini & Ollama wrapping**: These providers lack a universal client interface for monkey-patching. `wrap_gemini` wraps `models.generate_content` if `google-genai` is installed; `wrap_ollama` wraps the `chat` method. For full control, use `record_usage()` manually.
 - **Single-process**: TokenLedger is designed for single-process apps. Multi-process budget enforcement requires external coordination.
 - **Rate limiter**: Simple token bucket suitable for single-process use. For distributed rate limiting, use an external proxy.
-- **SQLite concurrent writes**: SqliteStore uses SQLite's default isolation — safe for single-process concurrent reads/writes; multi-process writes require an external connection pool.
-- **Obfuscation-at-rest**: Persisted JSONL with an `encryption_key` uses an XOR+HMAC scheme. This is obfuscation, **not** encryption — sufficient for casual privacy, not for compliance-grade requirements.
+- **SQLite concurrent writes**: SqliteStore uses WAL mode with a 5s busy timeout — safe for single-process concurrent reads/writes; multi-process writes require an external connection pool.
+- **Running totals growth**: `running_totals` aggregates per distinct dimension value (user, project, tenant...) for O(1) budget checks on `"never"` reset cycles — it grows with distinct IDs, not records. Budget windows (`daily`/`weekly`/`monthly`) derive spend from the bounded record buffer instead.
 - **Mock-only integration tests**: Provider integration tests use mocked responses. Real API credentials are needed for end-to-end provider tests.
 
 ## Contributing

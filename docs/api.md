@@ -21,8 +21,11 @@ TokenLedger(
 )
 ```
 
-> Note: `encryption_key` enables HMAC-tagged XOR obfuscation of the persisted
-> JSONL file — casual privacy only, **not** encryption.
+> Note: `encryption_key` enables Fernet (AES-128-CBC + HMAC) encryption of the
+> persisted JSONL file when `cryptography` is installed (`[security]` extra);
+> without it, an HMAC-tagged XOR fallback is used — casual privacy only.
+> `differential_privacy_epsilon` noise applies at the export/query boundary
+> (`get_records(apply_dp=True)`, `export_*`), never to stored records.
 
 ### Core Methods
 

@@ -561,6 +561,34 @@ class TestStreamWrapper:
         assert usage["output_tokens"] == 3
         assert usage["source"] == "api_reported"
 
+    def test_sync_stream_finalizes_on_early_break(self):
+        from tokenledger.core.interceptor import StreamWrapper
+
+        calls = []
+        wrapper = StreamWrapper(iter([1, 2, 3]), "openai", on_finish=lambda: calls.append(True))
+        for _chunk in wrapper:
+            break
+        assert calls == [True]
+
+    def test_async_stream_finalizes_on_early_break(self):
+        import asyncio
+
+        from tokenledger.core.interceptor import StreamWrapper
+
+        async def fake_stream():
+            for i in range(3):
+                yield i
+
+        calls = []
+
+        async def run():
+            wrapper = StreamWrapper(fake_stream(), "openai", on_finish=lambda: calls.append(True))
+            async for _chunk in wrapper:
+                break
+
+        asyncio.run(run())
+        assert calls == [True]
+
 
 class TestCompact:
     def test_compact_removes_old_records(self):

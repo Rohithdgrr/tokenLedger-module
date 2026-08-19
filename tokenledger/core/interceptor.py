@@ -122,16 +122,20 @@ class StreamWrapper:
             cb()
 
     def __iter__(self) -> Iterator[Any]:
-        for chunk in self._stream:
-            self._capture(chunk)
-            yield chunk
-        self._finalize()
+        try:
+            for chunk in self._stream:
+                self._capture(chunk)
+                yield chunk
+        finally:
+            self._finalize()
 
     async def __aiter__(self) -> AsyncIterator[Any]:
-        async for chunk in self._stream:
-            self._capture(chunk)
-            yield chunk
-        self._finalize()
+        try:
+            async for chunk in self._stream:
+                self._capture(chunk)
+                yield chunk
+        finally:
+            self._finalize()
 
     def get_stream_text(self) -> str:
         return "".join(self._text_parts)
@@ -445,8 +449,6 @@ class InterceptionLayer:
         if self.ghost_mode:
             record["_ghost"] = True
         record = self.verifier.verify(record, raw_response)
-        if getattr(self.ledger, "differential_privacy_epsilon", None):
-            record = self.ledger._add_noise(record)
         self.store.insert_record(record)
         if self.on_record:
             self.on_record(record)
@@ -500,8 +502,10 @@ class InterceptionLayer:
         stream_text: str = "",
     ) -> None:
         self._apply_prompt_redaction(metadata, messages)
+        source = "stream"
         if not token_data:
             token_data = self._estimate_stream_usage(provider, metadata["model"], messages, stream_text)
+            source = "stream_fallback_estimated"
         record = build_record(
             provider=provider,
             model=metadata["model"],
@@ -510,7 +514,7 @@ class InterceptionLayer:
             user_id=metadata["user_id"],
             project_id=metadata["project_id"],
             latency_ms=round(latency_ms, 3),
-            source="stream",
+            source=source,
             pricing=self.pricing,
             status="success",
             tenant_id=metadata.get("tenant_id"),

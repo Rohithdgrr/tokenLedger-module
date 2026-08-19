@@ -86,8 +86,8 @@ def _temperature() -> dict[str, Any]:
     except (ImportError, AttributeError):
         pass
     try:
-        import subprocess
-        out = subprocess.check_output(
+        import subprocess  # nosec B404: fixed argv list, ssh-safe probes below
+        out = subprocess.check_output(  # nosec B603, B607: constant argv, no shell, timeout set
             ["wmic", "/namespace:\\\\root\\wmi", "PATH", "MSAcpi_ThermalZoneTemperature",
              "get", "CurrentTemperature", "/value"],
             timeout=5,
@@ -97,14 +97,14 @@ def _temperature() -> dict[str, Any]:
             temp_k = float(val.split("=")[1].strip())
             return {"cpu": {"current": round(temp_k - 273.15, 1)}}
     except Exception:
-        pass
+        return {}
     return {}
 
 
 def _gpu() -> dict[str, Any]:
     try:
-        import subprocess
-        out = subprocess.check_output(
+        import subprocess  # nosec B404: fixed argv list, ssh-safe probes below
+        out = subprocess.check_output(  # nosec B603, B607: constant argv, no shell, timeout set
             ["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
              "--format=csv,noheader,nounits"],
             timeout=5, stderr=subprocess.DEVNULL,

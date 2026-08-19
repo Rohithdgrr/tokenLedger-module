@@ -188,8 +188,10 @@ class PricingRegistry:
             return entry
         for k, v in self._registry.items():
             if k.endswith(":unknown"):
+                logger.warning("Unknown model %s:%s — using default pricing", provider, model)
                 return v
-        return {"input_per_token": 0.0, "output_per_token": 0.0, "currency": "USD"}
+        logger.warning("Unknown model %s:%s — no fallback pricing registered; assuming $0", provider, model)
+        return {"input_per_token": float(0), "output_per_token": float(0), "currency": "USD"}
 
     def register_custom(
         self,
