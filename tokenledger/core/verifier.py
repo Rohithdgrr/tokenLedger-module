@@ -43,8 +43,10 @@ class CostRecalculationRule(VerificationRule):
                 record["cost_usd"] = 0.0
             return None
         expected = pricing.calculate_cost(
-            record.get("provider", "unknown"), record.get("model", "unknown"),
-            record.get("input_tokens", 0), record.get("output_tokens", 0),
+            record.get("provider", "unknown"),
+            record.get("model", "unknown"),
+            record.get("input_tokens", 0),
+            record.get("output_tokens", 0),
         )
         if abs(record.get("cost_usd", 0) - expected) > 0.0001:
             record["cost_usd"] = expected
@@ -68,17 +70,27 @@ class NegativeLatencyRule(VerificationRule):
 
 
 class AnomalyDetectionRule(VerificationRule):
-    def __init__(self, threshold: float = 3.0):
+    def __init__(self, threshold: float = 3.0, window_size: int = 50, min_samples: int = 10):
         self.threshold = threshold
+        self.window_size = window_size
+        self.min_samples = min_samples
+        # Rolling per-user cost window — a cumulative average would be
+        # permanently inflated by one expensive request, making every
+        # subsequent normal request look anomalous.
+        self._recent: dict[str, list[float]] = {}
 
     def check(self, record: dict[str, Any], store: StorageBackend, pricing: PricingRegistry) -> Optional[str]:
         user_id = record.get("user_id", "anonymous")
-        user_totals = store.get_running_totals("user", user_id)
-        if user_totals.get("requests", 0) < 10:
-            return None
-        avg_cost = user_totals["cost_usd"] / user_totals["requests"]
         current_cost = record.get("cost_usd", 0)
-        if avg_cost > 0 and current_cost > (avg_cost * self.threshold):
+        recent = self._recent.setdefault(user_id, [])
+        if current_cost is not None:
+            recent.append(float(current_cost))
+            if len(recent) > self.window_size:
+                del recent[: len(recent) - self.window_size]
+        if len(recent) < self.min_samples:
+            return None
+        baseline = sorted(recent)[len(recent) // 2]
+        if baseline > 0 and current_cost > (baseline * self.threshold):
             return "ANOMALOUS_USAGE_PATTERN"
         return None
 
@@ -86,8 +98,7 @@ class AnomalyDetectionRule(VerificationRule):
 class VerificationEngine:
     """Pluggable verification pipeline with default rules."""
 
-    def __init__(self, pricing_registry: PricingRegistry, store: StorageBackend,
-                 custom_rules: Optional[list[VerificationRule]] = None):
+    def __init__(self, pricing_registry: PricingRegistry, store: StorageBackend, custom_rules: Optional[list[VerificationRule]] = None):
         self.pricing = pricing_registry
         self.store = store
         self.rules: list[VerificationRule] = custom_rules or [

@@ -87,24 +87,37 @@ class WebhookNotifier:
 
     def _flush_batch(self) -> None:
         with self._batch_lock:
-            batch, self._batch = self._batch, []
+            # Always release the fired timer reference so a throttled batch
+            # can be rescheduled (and on_record can start a fresh timer).
             if self._batch_timer:
                 self._batch_timer.cancel()
                 self._batch_timer = None
+            if not self._batch:
+                return
+            if self.throttle_interval and (time.monotonic() - self._last_send) < self.throttle_interval:
+                # Too soon to send — keep the batch and reschedule instead of
+                # dropping records on the floor.
+                wait = self.throttle_interval - (time.monotonic() - self._last_send)
+                self._batch_timer = threading.Timer(wait, self._flush_batch)
+                self._batch_timer.daemon = True
+                self._batch_timer.start()
+                return
+            batch, self._batch = self._batch, []
+        self._last_send = time.monotonic()
+        self._send_batch(batch)
+
+    def _send_batch(self, batch: list[dict[str, Any]]) -> None:
         if not batch:
             return
-        # Throttle: skip if called too recently
-        if self.throttle_interval and (time.monotonic() - self._last_send) < self.throttle_interval:
-            return
-        self._last_send = time.monotonic()
         if len(batch) == 1:
             r = batch[0]
-            self._post({
-                "event": "record",
-                "message": f"[TokenLedger] {r.get('model','?')} — "
-                f"${r.get('cost_usd',0):.6f}, {r.get('total_tokens',0)} tokens",
-                "record": r,
-            })
+            self._post(
+                {
+                    "event": "record",
+                    "message": f"[TokenLedger] {r.get('model', '?')} — ${r.get('cost_usd', 0):.6f}, {r.get('total_tokens', 0)} tokens",
+                    "record": r,
+                }
+            )
         else:
             self._post({"event": "batch", "count": len(batch), "records": batch})
 
@@ -114,48 +127,26 @@ class WebhookNotifier:
             return
         # Batch to avoid flooding at high throughput
         if self.batch_size <= 1:
-            self._post({
-                "event": "record",
-                "message": f"[TokenLedger] {record.get('model','?')} — "
-                f"${cost:.6f}, {record.get('total_tokens',0)} tokens",
-                "record": record,
-            })
+            self._send_batch([record])
             return
+        should_flush = False
         with self._batch_lock:
             self._batch.append(record)
             if len(self._batch) >= self.batch_size:
-                # flush synchronously without holding lock
-                batch = list(self._batch)
-                self._batch.clear()
                 if self._batch_timer:
                     self._batch_timer.cancel()
                     self._batch_timer = None
-            else:
-                if self._batch_timer is None:
-                    self._batch_timer = threading.Timer(self.flush_interval, self._flush_batch)
-                    self._batch_timer.daemon = True
-                    self._batch_timer.start()
-                return
-        # Flush outside lock for the batch_size-triggered case
-        if 'batch' in locals():
-            if len(batch) == 1:
-                r = batch[0]
-                self._post({
-                    "event": "record",
-                    "message": f"[TokenLedger] {r.get('model','?')} — "
-                    f"${r.get('cost_usd',0):.6f}, {r.get('total_tokens',0)} tokens",
-                    "record": r,
-                })
-            else:
-                self._post({"event": "batch", "count": len(batch), "records": batch})
+                should_flush = True
+            elif self._batch_timer is None:
+                self._batch_timer = threading.Timer(self.flush_interval, self._flush_batch)
+                self._batch_timer.daemon = True
+                self._batch_timer.start()
+        if should_flush:
+            # Route through _flush_batch so throttling applies here too.
+            self._flush_batch()
 
-    def on_budget_threshold(
-        self, scope: str, scope_id: str, current_spend: float, limit: float
-    ) -> None:
+    def on_budget_threshold(self, scope: str, scope_id: str, current_spend: float, limit: float) -> None:
         ratio = current_spend / limit if limit else 0
-        msg = (
-            f"[TokenLedger] Budget threshold: {scope}:{scope_id} "
-            f"at {ratio:.1%} (${current_spend:.4f} / ${limit:.4f})"
-        )
+        msg = f"[TokenLedger] Budget threshold: {scope}:{scope_id} at {ratio:.1%} (${current_spend:.4f} / ${limit:.4f})"
         logger.warning(msg)
         self._post({"event": "budget_threshold", "message": msg})

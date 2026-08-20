@@ -3,7 +3,12 @@ Token estimation when APIs do not report usage data.
 Uses tiktoken for OpenAI models, character heuristic for others.
 """
 
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+_tiktoken_fallback_logged = False
 
 
 class TokenEstimator:
@@ -15,12 +20,22 @@ class TokenEstimator:
 
     def _check_tiktoken(self) -> bool:
         """Check if tiktoken is available."""
+        global _tiktoken_fallback_logged
         try:
             import tiktoken  # noqa: F401
 
             return True
         except ImportError:
+            if not _tiktoken_fallback_logged:
+                _tiktoken_fallback_logged = True
+                logger.info(
+                    "tiktoken not installed — OpenAI token estimates use the "
+                    "character heuristic; pip install 'tokenledger-module[tiktoken]'"
+                )
             return False
+
+    def __repr__(self) -> str:
+        return f"<TokenEstimator tiktoken={'yes' if self._tiktoken_available else 'no'}>"
 
     def estimate(
         self,
@@ -80,8 +95,6 @@ class TokenEstimator:
         if not text:
             return 0
         # CJK characters are roughly 1 token each; Latin is ~4 chars/token.
-        cjk_count = sum(
-            1 for ch in text if "\u4e00" <= ch <= "\u9fff" or "\u3000" <= ch <= "\u303f"
-        )
+        cjk_count = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff" or "\u3000" <= ch <= "\u303f")
         latin_count = len(text) - cjk_count
         return max(1, (latin_count // 4) + cjk_count)

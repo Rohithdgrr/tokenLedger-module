@@ -63,3 +63,10 @@ pip install "tokenledger-module[all]" # + provider SDKs, CLI (rich), system moni
 ```
 
 Zero external services required. All data lives in memory by default.
+
+## Guides
+
+- [API Reference](api.md) — `TokenLedger`, wallets, live server, differentiators
+- [Advanced Usage](advanced.md) — streaming, ghost vs. strict budget, health checks, context propagation
+- [Migrating Backends](migrating.md) — moving between `MemoryStore` and `SqliteStore`
+- [Security Policy](../SECURITY.md) — encryption fallback, LiveServer exposure, prompt-hash limits

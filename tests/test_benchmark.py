@@ -1,7 +1,15 @@
-"""Benchmarks for TokenLedger core operations."""
+"""Benchmarks for TokenLedger core operations.
 
+Requires the pytest-benchmark plugin (installed via the ``dev``/``ci``
+extras). Skipped cleanly when the plugin is missing so local runs without
+the extra never fail.
+"""
 
-from tokenledger import TokenLedger
+import pytest
+
+pytest.importorskip("pytest_benchmark")
+
+from tokenledger import TokenLedger  # noqa: E402
 
 
 def test_benchmark_record_usage(benchmark):

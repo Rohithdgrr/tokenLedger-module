@@ -3,6 +3,7 @@ Budget enforcement system.
 Pre-flight spending control with multiple scope levels.
 """
 
+import logging
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -11,6 +12,8 @@ from .exceptions import BudgetExceededError
 from .pricing import PricingRegistry
 from .scopes import matches_scope
 from .store import StorageBackend, normalize_ts
+
+logger = logging.getLogger(__name__)
 
 # Re-export for backwards compatibility
 __all__ = ["BudgetExceededError"]
@@ -29,6 +32,9 @@ class BudgetEnforcer:
         self.pricing = pricing
         self._avg_output_per_model: dict[str, float] = defaultdict(lambda: 0.5)
 
+    def __repr__(self) -> str:
+        return f"<BudgetEnforcer budgets={len(self.store.get_all_budgets())}>"
+
     def check_budget(
         self,
         user_id: str,
@@ -46,9 +52,7 @@ class BudgetEnforcer:
         """Check if the request is within budget."""
         if not self.store.get_all_budgets():
             return True
-        applicable_budgets = self._get_applicable_budgets(
-            user_id, project_id, provider, model, tenant_id, conversation_id, agent_id
-        )
+        applicable_budgets = self._get_applicable_budgets(user_id, project_id, provider, model, tenant_id, conversation_id, agent_id)
 
         for budget_key, budget in applicable_budgets:
             current_spend = self._calculate_current_spend(budget)
@@ -58,8 +62,7 @@ class BudgetEnforcer:
             if projected_spend > budget.get("limit_usd", float("inf")):
                 raise BudgetExceededError(
                     message=(
-                        f"Budget exceeded for {budget_key}: "
-                        f"${current_spend:.4f} + ${estimated_cost:.4f} > ${budget['limit_usd']:.4f}"
+                        f"Budget exceeded for {budget_key}: ${current_spend:.4f} + ${estimated_cost:.4f} > ${budget['limit_usd']:.4f}"
                     ),
                     scope=budget.get("scope", ""),
                     scope_id=budget.get("scope_id", ""),
@@ -68,6 +71,34 @@ class BudgetEnforcer:
                 )
 
         return True
+
+    def get_budget_status(self) -> list[dict[str, Any]]:
+        """Return spend/utilization for every configured budget rule.
+
+        Used by :meth:`TokenLedger.health` and monitoring dashboards.
+        Never raises — a read failure on one rule yields ``-1`` spend so the
+        rest of the report stays useful.
+        """
+        result = []
+        for _key, budget in self.store.get_all_budgets().items():
+            scope = budget.get("scope", "global")
+            scope_id = budget.get("scope_id", "")
+            limit = float(budget.get("limit_usd", 0.0))
+            try:
+                spent = float(self._calculate_current_spend(budget))
+            except Exception:  # pragma: no cover — defensive
+                spent = -1.0
+            result.append(
+                {
+                    "scope": scope,
+                    "scope_id": scope_id,
+                    "limit_usd": limit,
+                    "spent_usd": round(spent, 6),
+                    "utilization_percent": round((spent / limit * 100) if limit else 0.0, 2),
+                    "reset_cycle": budget.get("reset_cycle", "monthly"),
+                }
+            )
+        return result
 
     def _get_applicable_budgets(
         self,
@@ -137,8 +168,8 @@ class BudgetEnforcer:
                 optimized = self.store.get_windowed_spend(budget, window_start)  # type: ignore[operator]
                 if optimized is not None:
                     return round(float(optimized), 10)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("windowed spend query failed, falling back to scan: %s", e)
         total = 0.0
         ws_norm = normalize_ts(window_start)
         for record in self.store.get_records():
@@ -173,9 +204,7 @@ class BudgetEnforcer:
             start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         elif reset_cycle == "weekly":
             days_since_monday = now.weekday()
-            start = (now - timedelta(days=days_since_monday)).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
+            start = (now - timedelta(days=days_since_monday)).replace(hour=0, minute=0, second=0, microsecond=0)
         elif reset_cycle == "monthly":
             start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         else:

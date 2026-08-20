@@ -52,6 +52,48 @@ Without it, files are XOR-obfuscated and HMAC-tagged — a casual-privacy fallba
 with a key are unreadable without it (wrong or missing keys fail with a warning
 and load zero records).
 
+## Ghost Mode vs. Strict Budget
+
+Both knobs are **rate controls, not access control** — they run client-side
+and a compromised process can bypass them.
+
+| | `ghost_mode=True` | `strict_budget=True` |
+|---|---|---|
+| Pre-flight budget check | Runs, but never raises | Runs and raises `BudgetExceededError` |
+| Request | Allowed regardless of spend | Allowed only if within budget |
+| Recording | Recorded with `_ghost=True`, excluded from spend/totals | Recorded normally; **if the actual cost exceeds budget post-hoc, a `BudgetExceededError` is raised** |
+| Typical use | Dry-run / shadow deploy — measure what *would* be blocked | Hard enforcement for non-critical internal tools |
+
+```python
+shadow = TokenLedger(ghost_mode=True)        # measure first
+# ... after review ...
+prod = TokenLedger(strict_budget=True)       # enforce
+```
+
+`ghost_mode` and `strict_budget` are independent and can be combined: ghost
+mode records a shadow of every request without enforcing, strict budget
+enforces pre-flight and raises after the fact if the real bill overshoots.
+
+> Post-hoc enforcement raises *after* the provider call completes — the
+> tokens were already consumed. For zero-risk scenarios use a wallet
+> (`create_wallet`) or pre-flight-only policy.
+
+## Health Checks
+
+```python
+ledger.health()
+# {'store': {'type': 'MemoryStore', 'records': 42, 'persisted': True},
+#  'budgets': [{'scope': 'user', 'scope_id': 'alice', 'limit_usd': 10.0,
+#               'spent_usd': 2.5, 'utilization_percent': 25.0,
+#               'reset_cycle': 'daily'}],
+#  'circuits': {'openai': 'closed'},
+#  'uptime_s': 123.4,
+#  'warnings': []}
+```
+
+Poll safely on any interval — `get_budget_status()` never raises, and
+windowed budgets use the store's indexed path when available.
+
 ## Prompt Redaction
 
 ```python

@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.5.1 (2026-08-21)
+
+Two audit hardening passes (50+ fixes) plus a third-pass review round:
+
+- **Checksums & integrity**: `_checksum` now included in SQLite inserts (migration for old DBs), unordered JSON hashing with backward-compatible validation of pre-1.5.1 sorted checksums, `verify_immutability` on both backends
+- **Budget correctness**: "never" budgets survive retention pruning in both `MemoryStore` and `SqliteStore` (`compact()` preserves cumulative spend); post-hoc enforcement raises `BudgetExceededError` on real overruns; all budget scopes (provider/model/tenant/conversation/agent) participate in pre-flight; windowed spend for daily/weekly/monthly windows; `delete_budget` API added; CLI budget display is now window-aware instead of cumulative
+- **Timestamp handling**: Py3.9/3.10-safe ISO parsing (`Z` suffix), naive-UTC normalization used consistently, retention pruning robust on old persisted files; cached `_ts_normalized` at insert makes windowed budget scans ~10x cheaper at 100k+ record scale
+- **Interceptor/proxy hardening**: `_ProxyWrapper` tracks direct leaf access (`proxy.create`), proper `__repr__`; `_wrap_attr` stores class-level descriptors so `unwrap()` restores them; tracking kwargs never mutated; sync/async retry timeouts applied per attempt; wrapped failures recorded by `@track`; `_track_request` no longer masks the original exception when circuit-breaker recording fails
+- **Concurrency & threading**: `CostContractRegistry` and `EstimatorFeedback` lock-guarded; `TokenBucket.async_consume` uses `asyncio.Lock`; `SystemMonitor` collection thread survives probe failures, returns cache-backed snapshots while running (no more per-request wmic/nvidia-smi blocking), idempotent `atexit`; `Wallet` debits serialized; `WebhookNotifier` batches with throttling and never drops throttled records
+- **Observability**: OTel-friendly health checks, structured blocked-attempt records with scope fields, best-effort store writes logged, system metrics capped at 10,000
+- **Streaming & extraction**: stream usage recorded from `prompt_tokens_details.cached_tokens`, partial-usage streams finalize without masking errors, char-heuristic CJK estimation
+- **CLI**: `--sqlite PATH` flag, interactive loop survives command errors, `tokenledger cost` preview
+- Test suite: **282 tests**, bandit 0 findings, ruff clean, coverage gate 80%
+
 ## v1.5.0 (2026-08-20)
 
 - **Live spend server**: `ledger.serve(host, port)` (or `LiveServer`) runs a stdlib daemon HTTP server — `GET /stats` returns a JSON snapshot (requests, tokens, cost, per-provider breakdown, running totals) and `GET /stream` pushes Server-Sent Events per recorded usage with a 15s keepalive heartbeat; CORS enabled for browser dashboards; chains (never clobbers) any existing `on_record` hook and restores it on `stop()`

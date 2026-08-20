@@ -3,11 +3,14 @@ Analytics and aggregation engine.
 Pure Python queries with O(1) lookups via running totals.
 """
 
+import logging
 from collections import Counter
 from typing import Any, Optional
 
 from .scopes import matches_scope
 from .store import StorageBackend
+
+logger = logging.getLogger(__name__)
 
 
 class AnalyticsEngine:
@@ -18,6 +21,9 @@ class AnalyticsEngine:
 
     def __init__(self, store: StorageBackend):
         self.store = store
+
+    def __repr__(self) -> str:
+        return f"<AnalyticsEngine records={self.store.get_record_count()}>"
 
     def get_summary(
         self,
@@ -67,17 +73,10 @@ class AnalyticsEngine:
             }
         base["budget_utilization"] = budget_utilization
 
-        model_aggs = [
-            {"model": key[len("model:"):], **agg}
-            for key, agg in self.store.list_running_totals("model:")
-        ]
-        provider_aggs = [
-            {"provider": key[len("provider:"):], **agg}
-            for key, agg in self.store.list_running_totals("provider:")
-        ]
+        model_aggs = [{"model": key[len("model:") :], **agg} for key, agg in self.store.list_running_totals("model:")]
+        provider_aggs = [{"provider": key[len("provider:") :], **agg} for key, agg in self.store.list_running_totals("provider:")]
         base["top_models"] = [
-            {"model": m["model"], "tokens": m["total_tokens"]}
-            for m in sorted(model_aggs, key=lambda x: -x["total_tokens"])[:top_k]
+            {"model": m["model"], "tokens": m["total_tokens"]} for m in sorted(model_aggs, key=lambda x: -x["total_tokens"])[:top_k]
         ]
         base["top_providers"] = [
             {"provider": p["provider"], "tokens": p["total_tokens"]}
@@ -98,7 +97,7 @@ class AnalyticsEngine:
         """Get spending breakdown by a dimension."""
         prefix = f"{dimension}:"
         all_totals = self.store.list_running_totals(prefix)
-        results = [{"id": key[len(prefix):], **agg} for key, agg in all_totals]
+        results = [{"id": key[len(prefix) :], **agg} for key, agg in all_totals]
         return sorted(results, key=lambda x: x.get("cost_usd", 0), reverse=True)
 
     def get_trend(self, dimension: str, dimension_id: str, granularity: str = "day") -> list[dict[str, Any]]:
@@ -214,8 +213,8 @@ class AnalyticsEngine:
                 optimized = self.store.get_windowed_spend(budget, window_start)
                 if optimized is not None:
                     return round(float(optimized), 6)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("windowed spend query failed, falling back to scan: %s", e)
         ws_norm = normalize_ts(window_start)
         total = 0.0
         for record in self.store.get_records():

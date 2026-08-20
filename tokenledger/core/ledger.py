@@ -6,6 +6,7 @@ import functools
 import hashlib
 import inspect
 import json
+import logging
 import math
 import secrets
 import time
@@ -109,8 +110,6 @@ class _UsageContext:
         try:
             self._record("error" if exc_type else "success")
         except Exception as e:
-            import logging
-
             logging.getLogger(__name__).warning("Failed to record usage block: %s", e)
         return False
 
@@ -121,8 +120,6 @@ class _UsageContext:
         try:
             self._record("error" if exc_type else "success")
         except Exception as e:
-            import logging
-
             logging.getLogger(__name__).warning("Failed to record usage block: %s", e)
         return False
 
@@ -153,11 +150,13 @@ class TokenLedger:
         ghost_persist: bool = True,
     ):
         if unknown_model_policy not in ("block", "allow", "estimate"):
-            raise ValueError(
-                f"unknown_model_policy must be 'block', 'allow', or 'estimate', got {unknown_model_policy!r}"
-            )
+            raise ValueError(f"unknown_model_policy must be 'block', 'allow', or 'estimate', got {unknown_model_policy!r}")
         if differential_privacy_epsilon is not None and differential_privacy_epsilon <= 0:
             raise ValueError("differential_privacy_epsilon must be positive (or None to disable)")
+        if max_records < 1:
+            raise ValueError(f"max_records must be >= 1, got {max_records}")
+        if retention_days < 0:
+            raise ValueError(f"retention_days must be non-negative, got {retention_days}")
         self.store = store or MemoryStore(
             persist_path=persist_path,
             max_records=max_records,
@@ -195,6 +194,42 @@ class TokenLedger:
         self.cost_contracts = CostContractRegistry()
         self.prompt_evolution = PromptEvolutionTracker()
         self.local_models = LocalModelRegistry()
+        self._started_at = time.monotonic()
+
+    def __repr__(self) -> str:
+        return (
+            f"<TokenLedger records={self.store.get_record_count()} "
+            f"budgets={len(self.store.get_all_budgets())} "
+            f"store={type(self.store).__name__}>"
+        )
+
+    def health(self) -> dict[str, Any]:
+        """Return operational health for diagnostics and monitoring probes.
+
+        Includes store state, budget proximity, circuit breaker state, and
+        uptime since construction. Safe to call on every health-check poll —
+        all queries are O(1) aside from budget spend (windowed when possible).
+        """
+        try:
+            records = self.store.get_record_count()
+        except Exception:  # pragma: no cover — defensive for exotic backends
+            records = -1
+        status = self.budget_enforcer.get_budget_status()
+        warnings: list[str] = []
+        for entry in status:
+            if entry.get("utilization_percent", 0) >= 80:
+                warnings.append(f"budget {entry['scope']}:{entry['scope_id']} at {entry['utilization_percent']:.0f}%")
+        return {
+            "store": {
+                "type": type(self.store).__name__,
+                "records": records,
+                "persisted": bool(getattr(self.store, "persist_path", None)),
+            },
+            "budgets": status,
+            "circuits": {p: e["circuit_state"] for p, e in self.interceptor.get_health().items()},
+            "uptime_s": round(time.monotonic() - self._started_at, 2),
+            "warnings": warnings,
+        }
 
     def wrap_proxy(self, client: Any, attr_path: str, provider: str) -> Any:
         """Non-mutating proxy wrapper — does not monkey-patch *client*."""
@@ -280,9 +315,14 @@ class TokenLedger:
                         return result
                     except Exception as e:
                         self._record_decorated(
-                            provider, model, user_id, project_id,
+                            provider,
+                            model,
+                            user_id,
+                            project_id,
                             {"_error": str(e), "_error_type": type(e).__name__},
-                            start, tracking_kwargs, status="error",
+                            start,
+                            tracking_kwargs,
+                            status="error",
                         )
                         raise
 
@@ -297,9 +337,14 @@ class TokenLedger:
                     return result
                 except Exception as e:
                     self._record_decorated(
-                        provider, model, user_id, project_id,
+                        provider,
+                        model,
+                        user_id,
+                        project_id,
                         {"_error": str(e), "_error_type": type(e).__name__},
-                        start, tracking_kwargs, status="error",
+                        start,
+                        tracking_kwargs,
+                        status="error",
                     )
                     raise
 
@@ -436,8 +481,6 @@ class TokenLedger:
             self.store.insert_record(verified)
         except Exception as e:
             # Best-effort persistence: recording must never break business logic.
-            import logging
-
             logging.getLogger(__name__).error("Failed to persist usage record: %s", e)
             verified["_store_error"] = str(e)
         if self.interceptor.on_record:
@@ -448,8 +491,8 @@ class TokenLedger:
                 if not self.cost_contracts.check(contract.name, float(verified.get("cost_usd", 0) or 0)):
                     verified["contract_breached"] = contract.name
                     break
-        except Exception:
-            pass
+        except Exception as e:
+            logging.getLogger(__name__).debug("cost contract check failed: %s", e)
         # Post-hoc strict budget enforcement: actual cost may exceed estimate.
         # Applies to budgets matching this record's scope only.
         if self.strict_budget and not _skip_budget_check and verified.get("status") not in ("blocked", "error"):
@@ -476,8 +519,8 @@ class TokenLedger:
                             raise err
                 except BudgetExceededError:
                     raise
-                except Exception:
-                    pass
+                except Exception as e:
+                    logging.getLogger(__name__).debug("post-hoc budget check failed: %s", e)
         return verified
 
     def _add_noise(self, record: dict[str, Any]) -> dict[str, Any]:
@@ -506,8 +549,6 @@ class TokenLedger:
         """
         if not self.differential_privacy_epsilon:
             return records
-        import logging
-
         logging.getLogger(__name__).warning("Per-record DP noise compounds on aggregation. Use apply_dp on summaries instead.")
         return [self._add_noise(dict(r)) for r in records]
 
@@ -585,6 +626,10 @@ class TokenLedger:
         if limit_usd < 0:
             raise ValueError("limit_usd must be non-negative")
         self.store.set_budget(scope, scope_id, {"scope": scope, "scope_id": scope_id, "limit_usd": limit_usd, "reset_cycle": reset_cycle})
+
+    def get_budget_status(self) -> list[dict[str, Any]]:
+        """Per-rule budget spend report (see :meth:`BudgetEnforcer.get_budget_status`)."""
+        return self.budget_enforcer.get_budget_status()
 
     def get_summary(self, scope: str = "global", scope_id: str = "all", apply_dp: bool = False) -> dict[str, Any]:
         eps = self.differential_privacy_epsilon if apply_dp else None

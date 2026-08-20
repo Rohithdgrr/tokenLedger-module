@@ -15,6 +15,8 @@ from typing import Any, Optional, cast
 
 logger = logging.getLogger(__name__)
 
+_encryption_fallback_logged = False
+
 
 class StorageBackend(abc.ABC):
     """Abstract storage backend that all stores must implement."""
@@ -77,6 +79,19 @@ class StorageBackend(abc.ABC):
         """Remove a budget rule. Persisted backends should override to delete rows."""
         self.budgets.pop(f"{scope}:{scope_id}", None)
 
+    def _collect_never_totals(self) -> dict[str, dict[str, Any]]:
+        """Snapshot running totals for budgets that must never reset.
+
+        Retention pruning rebuilds running totals from surviving records; the
+        spend that came from pruned records would otherwise be lost. Backends
+        call this before pruning and :meth:`_restore_never_totals` after.
+        """
+        return {key: dict(self.running_totals.get(key, {})) for key, b in self.budgets.items() if b.get("reset_cycle") == "never"}
+
+    def _restore_never_totals(self, saved: dict[str, dict[str, Any]]) -> None:
+        for key, totals in saved.items():
+            self.running_totals.setdefault(key, {}).update(totals)
+
 
 def _is_billable(record: dict[str, Any]) -> bool:
     """Ghost-mode and blocked/error records must not count toward spend."""
@@ -98,6 +113,9 @@ class RetentionPolicy:
 def _checksum(record: dict[str, Any]) -> str:
     # Records are built in a deterministic key order, so sort_keys is
     # unnecessary — one dumps + hash pass is ~2x faster per record.
+    # NOTE: the serialized bytes are part of the checksum contract — do not
+    # switch to a compact encoder (e.g. orjson) or every persisted file
+    # written by an older version will report as tampered.
     raw = json.dumps(record, default=str).encode()
     return hashlib.sha256(raw).hexdigest()
 
@@ -187,6 +205,13 @@ def _encrypt(data: bytes, key: bytes) -> bytes:
     cipher = _fernet(key)
     if cipher is not None:
         return cast(bytes, cipher.encrypt(data))
+    global _encryption_fallback_logged
+    if not _encryption_fallback_logged:
+        _encryption_fallback_logged = True
+        logger.warning(
+            "cryptography not installed — falling back to XOR+HMAC obfuscation "
+            "(casual privacy only, not encryption); pip install 'tokenledger-module[security]'"
+        )
     blob = _xor(data, key)
     mac = hmac.new(key, blob, hashlib.sha256).digest()
     return _MAGIC + mac + blob
@@ -243,8 +268,16 @@ class MemoryStore(StorageBackend):
         if persist_path and os.path.exists(persist_path):
             self._load_from_disk()
 
+    def __repr__(self) -> str:
+        return f"<MemoryStore records={len(self.records)} persist={self.persist_path!r} encrypted={bool(self.encryption_key)}>"
+
     def insert_record(self, record: dict[str, Any]) -> None:
         with self.lock:
+            # Cache the normalized timestamp once per record — budget checks
+            # call get_windowed_spend on every record, and datetime parsing
+            # costs microseconds each. Records written by older versions
+            # lack the key and fall back to parsing in get_windowed_spend.
+            record["_ts_normalized"] = normalize_ts(record.get("timestamp", ""))
             record["_checksum"] = _checksum(record)
             self.records.append(record)
             self._update_running_totals(record)
@@ -415,8 +448,10 @@ class MemoryStore(StorageBackend):
         total = 0.0
         with self.lock:
             for r in self.records:
-                ts = r.get("timestamp", "")
-                if ts and normalize_ts(ts) < ws:
+                norm = r.get("_ts_normalized")
+                if norm is None:
+                    norm = normalize_ts(r.get("timestamp", ""))
+                if norm and norm < ws:
                     continue
                 if r.get("status") in ("blocked", "error") or r.get("_ghost"):
                     continue
@@ -446,7 +481,9 @@ class MemoryStore(StorageBackend):
         for r in self.records:
             ts = r.get("timestamp", "")
             try:
-                parsed = datetime.fromisoformat(ts)
+                # .replace("Z", "+00:00") keeps Py3.9/3.10 compatible — their
+                # fromisoformat does not accept the Z suffix.
+                parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
             except (ValueError, TypeError):
                 parsed = None
             if parsed is not None and parsed.tzinfo is None:
@@ -464,18 +501,6 @@ class MemoryStore(StorageBackend):
             self._restore_never_totals(saved_never_totals)
             if self.persist_path and self.retention.archive_on_trim:
                 self._rewrite_disk()
-
-    def _collect_never_totals(self) -> dict[str, dict[str, Any]]:
-        """Snapshot running totals for budgets that must never reset."""
-        return {
-            key: dict(self.running_totals.get(key, {}))
-            for key, b in self.budgets.items()
-            if b.get("reset_cycle") == "never"
-        }
-
-    def _restore_never_totals(self, saved: dict[str, dict[str, Any]]) -> None:
-        for key, totals in saved.items():
-            self.running_totals.setdefault(key, {}).update(totals)
 
     def _rewrite_disk(self) -> None:
         """Rewrite the on-disk JSONL to match current in-memory records (used after retention trim)."""

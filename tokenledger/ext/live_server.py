@@ -114,18 +114,16 @@ class LiveServer:
                 self._subscribers.remove(sub)
 
     def _stats_payload(self) -> dict[str, Any]:
+        from datetime import datetime, timezone
+
         summary = self.ledger.get_summary()
         return {
             "record_count": summary.get("requests", 0),
             "total_tokens": summary.get("total_tokens", 0),
             "cost_usd": summary.get("cost_usd", 0.0),
             "providers": self.ledger.get_spending_by_provider(),
-            "running_totals": {
-                key: totals
-                for key, totals in self.ledger.store.list_running_totals()
-                if key == "global:all"
-            },
-            "generated_at": summary.get("generated_at", ""),
+            "running_totals": {key: totals for key, totals in self.ledger.store.list_running_totals() if key == "global:all"},
+            "generated_at": datetime.now(timezone.utc).isoformat(),
         }
 
 

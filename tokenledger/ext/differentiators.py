@@ -1,4 +1,5 @@
 """Differentiating features: what-if, ROI, routing, contracts, evolution, local cost."""
+
 from __future__ import annotations
 
 import difflib
@@ -68,21 +69,36 @@ def verify_signed_ledger(bundle: dict[str, Any], key: str) -> bool:
 
 
 class PromptCache:
-    def __init__(self, similarity_threshold: float = 0.95):
-        self._cache: dict[str, str] = {}
+    def __init__(self, similarity_threshold: float = 0.95, ttl_seconds: float | None = None):
+        self._cache: dict[str, tuple[str, float]] = {}
         self._threshold = similarity_threshold
+        self._ttl = ttl_seconds
+
+    def _expired(self, stamped: float) -> bool:
+        return self._ttl is not None and (time.monotonic() - stamped) > self._ttl
 
     def put(self, key: str, content: str) -> None:
-        self._cache[key] = content
+        self._cache[key] = (content, time.monotonic())
 
     def get(self, key: str) -> str | None:
-        return self._cache.get(key)
+        entry = self._cache.get(key)
+        if entry is None:
+            return None
+        content, stamped = entry
+        if self._expired(stamped):
+            self._cache.pop(key, None)
+            return None
+        return content
 
     def find_similar(self, content: str, threshold: float | None = None) -> list[tuple[str, float]]:
         t = threshold if threshold is not None else self._threshold
         results: list[tuple[str, float]] = []
-        for k, v in self._cache.items():
-            ratio = difflib.SequenceMatcher(None, content, v).ratio()
+        for k, entry in list(self._cache.items()):
+            value, stamped = entry
+            if self._expired(stamped):
+                self._cache.pop(k, None)
+                continue
+            ratio = difflib.SequenceMatcher(None, content, value).ratio()
             if ratio >= t:
                 results.append((k, round(ratio, 4)))
         return sorted(results, key=lambda x: -x[1])
@@ -91,24 +107,27 @@ class PromptCache:
 class EstimatorFeedback:
     def __init__(self):
         self._stats: dict[str, dict[str, float]] = {}
+        self._lock = threading.Lock()
 
     def report(self, model: str, provider: str, estimated_tokens: int, actual_tokens: int) -> None:
         key = f"{provider}:{model}"
-        s = self._stats.setdefault(key, {"count": 0, "total_error": 0.0, "total_estimated": 0, "total_actual": 0})
-        s["count"] += 1
-        s["total_error"] += abs(estimated_tokens - actual_tokens) / max(actual_tokens, 1)
-        s["total_estimated"] += estimated_tokens
-        s["total_actual"] += actual_tokens
+        with self._lock:
+            s = self._stats.setdefault(key, {"count": 0, "total_error": 0.0, "total_estimated": 0, "total_actual": 0})
+            s["count"] += 1
+            s["total_error"] += abs(estimated_tokens - actual_tokens) / max(actual_tokens, 1)
+            s["total_estimated"] += estimated_tokens
+            s["total_actual"] += actual_tokens
 
     def get_accuracy(self, model: str, provider: str) -> dict[str, Any]:
-        s = self._stats.get(f"{provider}:{model}")
-        if not s or s["count"] == 0:
-            return {"count": 0, "avg_error_pct": 0, "correction_factor": 1.0}
-        return {
-            "count": s["count"],
-            "avg_error_pct": round(s["total_error"] / s["count"] * 100, 2),
-            "correction_factor": round(s["total_actual"] / s["total_estimated"], 4) if s["total_estimated"] else 1.0,
-        }
+        with self._lock:
+            s = self._stats.get(f"{provider}:{model}")
+            if not s or s["count"] == 0:
+                return {"count": 0, "avg_error_pct": 0, "correction_factor": 1.0}
+            return {
+                "count": s["count"],
+                "avg_error_pct": round(s["total_error"] / s["count"] * 100, 2),
+                "correction_factor": round(s["total_actual"] / s["total_estimated"], 4) if s["total_estimated"] else 1.0,
+            }
 
     def adjust(self, model: str, provider: str, estimated_tokens: int) -> int:
         info = self.get_accuracy(model, provider)
@@ -142,9 +161,9 @@ class ModelRouter:
         candidates = list(self.options)
         if max_cost is not None:
             candidates = [
-                o for o in candidates
-                if (o.input_cost_per_1k * input_tokens / 1000
-                    + o.output_cost_per_1k * output_tokens / 1000) <= max_cost
+                o
+                for o in candidates
+                if (o.input_cost_per_1k * input_tokens / 1000 + o.output_cost_per_1k * output_tokens / 1000) <= max_cost
             ]
         if not candidates:
             return None

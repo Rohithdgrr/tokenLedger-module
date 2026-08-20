@@ -30,6 +30,9 @@ class TokenExtractor:
     def __init__(self) -> None:
         self._custom_parsers: dict[str, Any] = {}
 
+    def __repr__(self) -> str:
+        return f"<TokenExtractor parsers={len(self._custom_parsers)}>"
+
     def register_parser(self, provider: str, parser: Any) -> None:
         """Register a custom parser for a provider.
 

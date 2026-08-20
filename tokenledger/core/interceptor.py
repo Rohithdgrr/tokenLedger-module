@@ -1,6 +1,7 @@
 """Method wrapping and monkey-patching for LLM clients."""
 
 import asyncio
+import contextvars
 import inspect
 import logging
 import threading
@@ -22,6 +23,12 @@ logger = logging.getLogger(__name__)
 
 TRACKING_KWARGS = {"user_id", "project_id", "conversation_id", "agent_id", "prompt_hash", "tenant_id"}
 
+# Context-bound tracking attributes. Middleware (FastAPI/Flask) can tag every
+# wrapped call without polluting function signatures:
+#   token = ledger_context.set({"user_id": request.user.id, "tenant_id": ...})
+#   try: ... finally: ledger_context.reset(token)
+ledger_context: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("ledger_context", default=None)
+
 TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
     ConnectionError,
     TimeoutError,
@@ -40,6 +47,8 @@ def _is_transient(exc: BaseException) -> bool:
 
 class TokenBucket:
     """Thread-safe token bucket rate limiter."""
+
+    __slots__ = ("rate", "tokens", "last", "lock", "_async_lock")
 
     def __init__(self, rate: float):
         self.rate = rate
@@ -101,6 +110,8 @@ class StreamWrapper:
     when no usage chunk arrived). This is intentional — partial cost is
     still billable.
     """
+
+    __slots__ = ("_stream", "_provider", "_on_finish", "_chunks", "_text_parts", "_max_chunks")
 
     def __init__(self, stream: Any, provider: str, on_finish: Optional[Callable] = None, max_chunks: int = 2000):
         self._stream = stream
@@ -195,6 +206,8 @@ class _ProxyWrapper:
     recursively wrapping intermediate attributes.
     """
 
+    __slots__ = ("_client", "_interceptor", "_provider", "_attr_path")
+
     def __init__(self, client: Any, interceptor: "InterceptionLayer", provider: str, attr_path: str):
         object.__setattr__(self, "_client", client)
         object.__setattr__(self, "_interceptor", interceptor)
@@ -208,12 +221,12 @@ class _ProxyWrapper:
         except AttributeError:
             raise
         attr_path = object.__getattribute__(self, "_attr_path")
-        # Exact leaf match
-        if attr_path == name:
+        # Exact leaf match — including direct access to the leaf method
+        # (e.g. proxy.create for attr_path="chat.completions.create") so the
+        # untracked original never leaks through.
+        if attr_path == name or attr_path.endswith("." + name):
             if callable(attr):
-                return object.__getattribute__(self, "_interceptor")._make_tracked_fn(
-                    attr, object.__getattribute__(self, "_provider")
-                )
+                return object.__getattribute__(self, "_interceptor")._make_tracked_fn(attr, object.__getattribute__(self, "_provider"))
             return attr
         # Intermediate segment: e.g. attr_path="chat.completions.create", name="chat"
         if attr_path.startswith(name + "."):
@@ -283,6 +296,9 @@ class InterceptionLayer:
         self._circuit_state: dict[str, dict] = {}
         self._rate_buckets: dict[str, TokenBucket] = {}
         self._provider_config: dict[str, dict[str, Any]] = {}
+
+    def __repr__(self) -> str:
+        return f"<InterceptionLayer wrapped_clients={len(self._original_methods)} providers={len(self._provider_config)}>"
 
     def configure_provider(self, provider: str, **kwargs: Any) -> None:
         """Per-provider override for retries, timeout, rate limit, etc."""
@@ -506,14 +522,15 @@ class InterceptionLayer:
                     raise
 
     def _extract_meta(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        ctx = ledger_context.get() or {}
         return {
-            "user_id": kwargs.get("user_id", "anonymous"),
-            "project_id": kwargs.get("project_id", "default"),
+            "user_id": kwargs.get("user_id", ctx.get("user_id", "anonymous")),
+            "project_id": kwargs.get("project_id", ctx.get("project_id", "default")),
             "model": kwargs.get("model", "unknown"),
-            "conversation_id": kwargs.get("conversation_id"),
-            "agent_id": kwargs.get("agent_id"),
-            "prompt_hash": kwargs.get("prompt_hash"),
-            "tenant_id": kwargs.get("tenant_id"),
+            "conversation_id": kwargs.get("conversation_id", ctx.get("conversation_id")),
+            "agent_id": kwargs.get("agent_id", ctx.get("agent_id")),
+            "prompt_hash": kwargs.get("prompt_hash", ctx.get("prompt_hash")),
+            "tenant_id": kwargs.get("tenant_id", ctx.get("tenant_id")),
         }
 
     def _budget_check(self, metadata: dict[str, Any], provider: str, kwargs: dict[str, Any]) -> None:
@@ -581,8 +598,8 @@ class InterceptionLayer:
                     if not ledger_contracts.check(contract.name, float(record.get("cost_usd", 0) or 0)):
                         record["contract_breached"] = contract.name
                         break
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("cost contract check failed: %s", e)
 
     def _enforce_post_hoc_budget(self, record: dict[str, Any]) -> None:
         """Raise after insertion when a post-hoc overrun exceeds the grace margin."""
@@ -608,8 +625,8 @@ class InterceptionLayer:
                         raise err
         except BudgetExceededError:
             raise
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("post-hoc budget check failed: %s", e)
 
     def _record(self, provider: str, metadata: dict[str, Any], messages: list, response: Any, latency_ms: float) -> None:
         self._apply_prompt_redaction(metadata, messages)
@@ -646,8 +663,12 @@ class InterceptionLayer:
         def on_finish() -> None:
             latency = (time.monotonic() - start_time) * 1000
             self._record_usage_from_stream(
-                provider, metadata, messages,
-                wrapped.get_accumulated_usage(), latency, wrapped.get_stream_text(),
+                provider,
+                metadata,
+                messages,
+                wrapped.get_accumulated_usage(),
+                latency,
+                wrapped.get_stream_text(),
             )
 
         wrapped = StreamWrapper(response, provider, on_finish=on_finish)
@@ -709,7 +730,10 @@ class InterceptionLayer:
         try:
             response = self._call_with_retry(original, args, kwargs, provider, self.request_timeout)
         except Exception:
-            self._record_result(provider, False)
+            try:
+                self._record_result(provider, False)
+            except Exception as cb_err:
+                logger.warning("Circuit breaker record failed: %s", cb_err)
             raise
         latency_ms = (time.monotonic() - start_time) * 1000
         self._record_result(provider, True)
@@ -729,7 +753,10 @@ class InterceptionLayer:
         try:
             response = await self._call_with_retry_async(original, args, kwargs, provider, self.request_timeout)
         except Exception:
-            self._record_result(provider, False)
+            try:
+                self._record_result(provider, False)
+            except Exception as cb_err:
+                logger.warning("Circuit breaker record failed: %s", cb_err)
             raise
         latency_ms = (time.monotonic() - start_time) * 1000
         self._record_result(provider, True)
@@ -751,6 +778,9 @@ class InterceptionLayer:
             source="budget_blocked",
             status="blocked",
             tenant_id=metadata.get("tenant_id"),
+            conversation_id=metadata.get("conversation_id"),
+            agent_id=metadata.get("agent_id"),
+            prompt_hash=metadata.get("prompt_hash"),
         )
         try:
             self.store.insert_record(record)

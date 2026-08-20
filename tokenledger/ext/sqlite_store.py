@@ -33,72 +33,76 @@ class SqliteStore(StorageBackend):
         self._local = threading.local()
         self._init_db()
 
+    def __repr__(self) -> str:
+        return f"<SqliteStore path={self.db_path!r} records={self.get_record_count()}>"
+
     def _conn(self) -> sqlite3.Connection:
-        """Return this thread's persistent connection (WAL mode, no per-op connect)."""
+        """Return this thread's persistent connection (WAL mode, no per-op connect).
+
+        Schema is ensured on *each* thread's connection: for file databases
+        this is a no-op after the first thread, but ``:memory:`` databases are
+        per-connection, so the DDL must run on every fresh connection.
+        """
         conn = getattr(self._local, "conn", None)
         if conn is None:
             conn = sqlite3.connect(self.db_path)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=5000")
             self._local.conn = conn
+            self._ensure_schema(conn)
         return conn
+
+    def _ensure_schema(self, conn: sqlite3.Connection) -> None:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS records (
+                record_id TEXT PRIMARY KEY,
+                timestamp TEXT,
+                provider TEXT,
+                model TEXT,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                total_tokens INTEGER DEFAULT 0,
+                cost_usd REAL DEFAULT 0,
+                latency_ms REAL DEFAULT 0,
+                user_id TEXT DEFAULT 'anonymous',
+                project_id TEXT DEFAULT 'default',
+                status TEXT DEFAULT 'success',
+                source TEXT DEFAULT 'manual',
+                conversation_id TEXT,
+                agent_id TEXT,
+                prompt_hash TEXT,
+                tenant_id TEXT,
+                _checksum TEXT,
+                extra TEXT
+            )
+        """)
+        # Migration for DBs created before _checksum column existed
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(records)")}
+        if "_checksum" not in cols:
+            conn.execute("ALTER TABLE records ADD COLUMN _checksum TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ts ON records(timestamp)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_provider ON records(provider)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_user ON records(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tenant ON records(tenant_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_conversation ON records(conversation_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_agent ON records(agent_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_project ON records(project_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_model ON records(model)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS budgets (
+                key TEXT PRIMARY KEY,
+                config TEXT
+            )
+        """)
 
     def _init_db(self) -> None:
         with self.lock:
-            conn = sqlite3.connect(self.db_path)
-            try:
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA busy_timeout=5000")
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS records (
-                        record_id TEXT PRIMARY KEY,
-                        timestamp TEXT,
-                        provider TEXT,
-                        model TEXT,
-                        input_tokens INTEGER DEFAULT 0,
-                        output_tokens INTEGER DEFAULT 0,
-                        total_tokens INTEGER DEFAULT 0,
-                        cost_usd REAL DEFAULT 0,
-                        latency_ms REAL DEFAULT 0,
-                        user_id TEXT DEFAULT 'anonymous',
-                        project_id TEXT DEFAULT 'default',
-                        status TEXT DEFAULT 'success',
-                        source TEXT DEFAULT 'manual',
-                        conversation_id TEXT,
-                        agent_id TEXT,
-                        prompt_hash TEXT,
-                        tenant_id TEXT,
-                        _checksum TEXT,
-                        extra TEXT
-                    )
-                """)
-                # Migration for DBs created before _checksum column existed
-                try:
-                    cols = {row[1] for row in conn.execute("PRAGMA table_info(records)")}
-                    if "_checksum" not in cols:
-                        conn.execute("ALTER TABLE records ADD COLUMN _checksum TEXT")
-                except Exception:
-                    pass
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_ts ON records(timestamp)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_provider ON records(provider)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_user ON records(user_id)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_tenant ON records(tenant_id)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_conversation ON records(conversation_id)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_agent ON records(agent_id)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_project ON records(project_id)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_model ON records(model)")
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS budgets (
-                        key TEXT PRIMARY KEY,
-                        config TEXT
-                    )
-                """)
-                conn.commit()
-                for key, config in conn.execute("SELECT key, config FROM budgets"):
-                    with contextlib.suppress(json.JSONDecodeError, TypeError):
-                        self.budgets[key] = json.loads(config)
-            finally:
-                conn.close()
+            conn = self._conn()
+            self._ensure_schema(conn)
+            conn.commit()
+            for key, config in conn.execute("SELECT key, config FROM budgets"):
+                with contextlib.suppress(json.JSONDecodeError, TypeError):
+                    self.budgets[key] = json.loads(config)
         self._rebuild_running_totals()
 
     def _rebuild_running_totals(self) -> None:
@@ -333,6 +337,9 @@ class SqliteStore(StorageBackend):
         cutoff = cutoff_dt.replace(tzinfo=None).isoformat()
         with self.lock:
             before = self.get_record_count()
+            # Retention would rebuild totals from surviving rows only — keep
+            # cumulative spend for "never" budgets (see StorageBackend).
+            saved_never_totals = self._collect_never_totals()
             conn = self._conn()
             conn.execute("DELETE FROM records WHERE timestamp < ?", (cutoff,))
             conn.execute(
@@ -347,6 +354,7 @@ class SqliteStore(StorageBackend):
             )
             conn.commit()
             self._rebuild_running_totals()
+            self._restore_never_totals(saved_never_totals)
             after = self.get_record_count()
         return {"removed": before - after, "remaining": after}
 
@@ -390,7 +398,8 @@ class SqliteStore(StorageBackend):
             conditions.append("agent_id = ?")
             params.append(scope_id)
         # global scope: no extra filter
-        sql = f"SELECT cost_usd, extra FROM records WHERE {' AND '.join(conditions)}"
+        # nosec B608: conditions from a fixed scope whitelist; scope_id values are parameterized
+        sql = f"SELECT cost_usd, extra FROM records WHERE {' AND '.join(conditions)}"  # nosec B608
         with self.lock:
             try:
                 conn = self._conn()

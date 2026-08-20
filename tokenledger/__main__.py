@@ -58,8 +58,7 @@ except ImportError:  # pragma: no cover - exercised only when rich is not instal
                 return self.title
             ncols = max(len(r) for r in rows)
             widths = [max(len(r[i]) if i < len(r) else 0 for r in rows) for i in range(ncols)]
-            lines = ["  ".join(r[i].ljust(widths[i]) if i < len(r) else " " * widths[i]
-                               for i in range(ncols)) for r in rows]
+            lines = ["  ".join(r[i].ljust(widths[i]) if i < len(r) else " " * widths[i] for i in range(ncols)) for r in rows]
             if self.title:
                 lines.insert(0, _TAG_RE.sub("", self.title))
             return "\n".join(lines)
@@ -78,6 +77,7 @@ except ImportError:  # pragma: no cover - exercised only when rich is not instal
 
         def __exit__(self, *exc: Any) -> None:
             return None
+
         def add_task(self, description: str = "", *args: Any, **kwargs: Any) -> Any:
             if description:
                 print(description)
@@ -117,8 +117,13 @@ LIGHT_THEME = {
 
 def _build_ledger(args: Any) -> Any:
     from tokenledger import TokenLedger
-    kwargs = {}
-    if args.file:
+    kwargs: dict[str, Any] = {}
+    sqlite_path = getattr(args, "sqlite", None)
+    if sqlite_path:
+        from tokenledger.ext.sqlite_store import SqliteStore
+
+        kwargs["store"] = SqliteStore(sqlite_path)
+    elif args.file:
         kwargs["persist_path"] = args.file
     key = getattr(args, "key", None)
     if key:
@@ -247,17 +252,16 @@ def cmd_compact(args: Any) -> None:
     with Progress(TextColumn("[progress.description]{task.description}"), console=console) as progress:
         progress.add_task(description="Compacting...", total=None)
         result = ledger.store.compact()
-    console.print(
-        f"[{LIGHT_THEME['fg']}]Removed {result['removed']} record(s), "
-        f"{result['remaining']} remaining.[/]"
-    )
+    console.print(f"[{LIGHT_THEME['fg']}]Removed {result['removed']} record(s), {result['remaining']} remaining.[/]")
 
 
 def cmd_update_pricing(args: Any) -> None:
     from tokenledger.core.pricing import PricingRegistry
+
     path = getattr(args, "pricing_file", None) or getattr(args, "file", None)
     if not path:
         import os
+
         builtin = os.path.join(os.path.dirname(__file__), "pricing_data.json")
         if os.path.exists(builtin):
             path = builtin
@@ -280,7 +284,8 @@ def cmd_health(args: Any) -> None:
     table.add_column("Value", style=LIGHT_THEME["fg"])
     table.add_row("Status", "OK")
     table.add_row("Records", str(len(records)))
-    table.add_row("Persist Path", args.file or "(in-memory only)")
+    persist = getattr(args, "sqlite", None) or args.file or "(in-memory only)"
+    table.add_row("Persist Path", persist)
     table.add_row("Integrity", f"{'OK' if not tampered else f'{len(tampered)} tampered'}")
     table.add_row("Budgets", str(len(ledger.store.get_all_budgets())))
     providers = sorted({r.get("provider", "?") for r in records}) if records else ["(none)"]
@@ -350,6 +355,7 @@ def _show_records(ledger: Any) -> None:
 
 def _show_pricing(args: Any) -> None:
     from tokenledger.core.pricing import PricingRegistry
+
     pr = PricingRegistry()
     models = pr.list_models()
     providers: dict[str, list[str]] = {}
@@ -392,10 +398,16 @@ def _show_budgets(ledger: Any) -> None:
     t.add_column("Spent", justify="right")
     t.add_column("Util%", justify="right")
     for bk, b in budgets.items():
-        util = ledger.store.get_running_totals(b.get("scope", "global"), b.get("scope_id", "all"))
-        spent = util.get("cost_usd", 0)
-        limit = b.get("limit_usd", 0)
-        pct = f"{spent / limit * 100:.1f}" if limit else "N/A"
+        # Window-aware spend (daily/weekly/monthly windows), not cumulative.
+        util = ledger.analytics.get_budget_utilization(b.get("scope", "global"), b.get("scope_id", "all"))
+        if util:
+            spent = util["spent_usd"]
+            limit = util["limit_usd"]
+            pct = f"{util['utilization_percent']:.1f}"
+        else:
+            spent = 0.0
+            limit = b.get("limit_usd", 0)
+            pct = "N/A"
         t.add_row(b.get("scope", "?"), bk, _format_cost(limit), _format_cost(spent), pct)
     console.print(t)
 
@@ -452,11 +464,15 @@ def _interactive(args: Any) -> None:
 
     while True:
         try:
-            key = Prompt.ask(
-                f"[{LIGHT_THEME['accent']}]tokenledger[/]",
-                default="",
-                show_default=False,
-            ).strip().lower()
+            key = (
+                Prompt.ask(
+                    f"[{LIGHT_THEME['accent']}]tokenledger[/]",
+                    default="",
+                    show_default=False,
+                )
+                .strip()
+                .lower()
+            )
         except (EOFError, KeyboardInterrupt):
             console.print()
             break
@@ -486,15 +502,16 @@ def _interactive(args: Any) -> None:
         }
         action = actions.get(key)
         if action:
-            action()
+            try:
+                action()
+            except Exception as e:  # noqa: BLE001 - interactive loop must survive
+                console.print(f"[red]Command failed: {e}[/]")
         else:
             console.print(f"[yellow]Unknown key: {key}. Press ? for help.[/]")
 
 
 def _export_interactive(args: Any, ledger: Any) -> None:
-    fmt = Prompt.ask(
-        "Export format", choices=["csv", "json"], default="csv"
-    )
+    fmt = Prompt.ask("Export format", choices=["csv", "json"], default="csv")
     path = Prompt.ask("Output file")
     args.format = fmt
     args.output = path
@@ -504,6 +521,7 @@ def _export_interactive(args: Any, ledger: Any) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(prog="tokenledger", description="LLM usage tracking CLI")
     parser.add_argument("--file", "-f", help="Path to JSONL persist file")
+    parser.add_argument("--sqlite", help="Path to SQLite database (uses SqliteStore backend)")
     parser.add_argument("--key", "-k", metavar="KEY", help="Encryption key for the persist file (AES)")
     parser.add_argument("--interactive", "-i", action="store_true", help="Force interactive mode")
 

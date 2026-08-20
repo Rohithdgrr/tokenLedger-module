@@ -64,6 +64,24 @@ Build a live spend server bound to this ledger (see `LiveServer` below).
 #### `get_summary(scope="global", scope_id="all")`
 Aggregated usage statistics with budget utilization, top models, anomalies.
 
+#### `health() -> dict`
+Operational health snapshot for monitoring probes: store type/count,
+per-budget spend and utilization (via `BudgetEnforcer.get_budget_status()`),
+per-provider circuit breaker state, uptime in seconds, and a `warnings` list
+flagging any budget over 80% utilization. O(1) except windowed budget spend.
+
+#### `get_budget_status() -> list[dict]`
+Per-rule budget report: `{scope, scope_id, limit_usd, spent_usd,
+utilization_percent, reset_cycle}`. Read failures degrade to `spent_usd=-1`
+without raising — safe to poll frequently.
+
+#### `wrap_proxy(client, attr_path, provider)` / `interceptor.wrap_proxy(...)`
+Non-mutating proxy wrapper. Returns a `TokenLedgerProxy` that intercepts
+`client.chat.completions.create`-style paths (e.g. `"chat.completions.create"`)
+without monkey-patching the original object — ideal for shared clients or
+strictly-mocked SDKs. `unwrap()` is not needed for proxies (the client is
+never modified).
+
 ### Analytics Methods
 
 - `get_spending_by_provider()` — cost breakdown by provider
@@ -127,6 +145,23 @@ Pure-stdlib daemon HTTP server for live spend visibility.
 - `attach_log_handler(ledger, logger_name="tokenledger.spend", level=logging.INFO) -> hook` — install an `on_record` callback that logs every usage record with fields attached as `LogRecord` `extra` (`provider`, `model`, `input_tokens`, `output_tokens`, `total_tokens`, `cost_usd`, `latency_ms`, `status`, `user_id`, `project_id`, `tenant_id`, `conversation_id`, `agent_id`, `source`, `timestamp`); preserves and chains the previous callback
 - `detach_log_handler(ledger, hook=None)` — restore the callback active before attachment
 
+### Context Propagation (`ledger_context`)
+
+```python
+from tokenledger import ledger_context
+
+token = ledger_context.set({"user_id": request.user.id, "tenant_id": "acme"})
+try:
+    wrapped.chat.completions.create(...)   # tagged with user/tenant automatically
+finally:
+    ledger_context.reset(token)
+```
+
+A `contextvars.ContextVar` read by the interceptor before every tracked call.
+Explicit kwargs always win over context values. Lets middleware (FastAPI/Flask)
+tag every call without threading `user_id=...` through signatures, and is
+safe under concurrency (asyncio tasks and threads each get their own context).
+
 ### VerificationEngine
 - `add_rule(rule)` — add custom `VerificationRule`
 - `verify(record)` — run all rules
@@ -144,6 +179,20 @@ Pure-stdlib daemon HTTP server for live spend visibility.
 - `put(key, content)` — cache a prompt
 - `get(key)` — retrieve exact match
 - `find_similar(content, threshold)` — near-duplicate detection
+
+### CostContract
+Dataclass: `name`, `max_cost_usd`, `scope="global"`, `scope_id="all"`,
+`current_spend=0.0`, `callback=None`. Registered in a `CostContractRegistry`.
+
+### LocalModelCost
+Dataclass modeling on-prem inference cost:
+- `name`, `power_watts` (default 10), `cost_per_kwh` (default 0.12),
+  `tokens_per_second` (default 30), `hardware_cost` (default 0)
+- Legacy `watts_per_second` kwarg is accepted and maps to `power_watts`
+- `cost_per_token() -> float` — electricity cost per token
+- `cost_for_tokens(input_tokens, output_tokens) -> float` — cost of a request
+- Register with `LocalModelRegistry.register(model)`; query with
+  `estimate_cost(name, input_tokens, output_tokens)` / `list_models()`
 
 ### EstimatorFeedback
 - `report(model, provider, estimated, actual)` — report estimation accuracy

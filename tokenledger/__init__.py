@@ -4,6 +4,7 @@ Zero database required.
 """
 
 from .core.exceptions import BudgetExceededError, CircuitBreakerOpenError, UnknownModelError, WalletExhaustedError
+from .core.interceptor import ledger_context
 from .core.ledger import TokenLedger
 from .core.store import MemoryStore
 from .core.wallet import Wallet
@@ -31,7 +32,7 @@ try:
 
     __version__ = _pkg_version("tokenledger-module")
 except Exception:
-    __version__ = "1.5.0"
+    __version__ = "1.5.1"
 __all__ = [
     "TokenLedger",
     "MemoryStore",
@@ -43,9 +44,19 @@ __all__ = [
     "LiveServer",
     "attach_log_handler",
     "detach_log_handler",
-    "PromptCache", "EstimatorFeedback", "ModelRouter", "RouteOption",
-    "CostContract", "CostContractRegistry", "PromptEvolutionTracker",
-    "LocalModelCost", "LocalModelRegistry",
-    "simulate_cost", "compute_roi", "sign_ledger", "verify_signed_ledger",
+    "PromptCache",
+    "EstimatorFeedback",
+    "ModelRouter",
+    "RouteOption",
+    "CostContract",
+    "CostContractRegistry",
+    "PromptEvolutionTracker",
+    "LocalModelCost",
+    "LocalModelRegistry",
+    "simulate_cost",
+    "compute_roi",
+    "sign_ledger",
+    "verify_signed_ledger",
     "auto_detect",
+    "ledger_context",
 ]
