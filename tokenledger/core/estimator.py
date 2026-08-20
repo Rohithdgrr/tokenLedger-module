@@ -79,4 +79,9 @@ class TokenEstimator:
     def _char_heuristic(self, text: str) -> int:
         if not text:
             return 0
-        return max(1, len(text) // 4)
+        # CJK characters are roughly 1 token each; Latin is ~4 chars/token.
+        cjk_count = sum(
+            1 for ch in text if "\u4e00" <= ch <= "\u9fff" or "\u3000" <= ch <= "\u303f"
+        )
+        latin_count = len(text) - cjk_count
+        return max(1, (latin_count // 4) + cjk_count)

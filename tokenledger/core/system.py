@@ -1,5 +1,6 @@
 """In-memory system metrics collector. Optional dependency: psutil."""
 
+import contextlib
 import threading
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -77,10 +78,8 @@ def _internet(timeout: float = 2.0) -> dict[str, Any]:
             continue
         finally:
             if s is not None:
-                try:
+                with contextlib.suppress(OSError):
                     s.close()
-                except OSError:
-                    pass
     return {"reachable": False, "latency_ms": 0.0, "host": ""}
 
 
@@ -173,6 +172,20 @@ class SystemMonitor:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._processor_info = _processor()
+        # Internet probes block up to 2s — cache them so each API call
+        # never pays the network probe cost.
+        self._internet_cache: dict[str, Any] = {"reachable": False, "latency_ms": 0.0, "host": ""}
+        self._internet_last_check = 0.0
+        self._internet_cache_ttl = 30.0
+
+    def _internet_cached(self) -> dict[str, Any]:
+        import time as _time
+
+        now = _time.monotonic()
+        if now - self._internet_last_check > self._internet_cache_ttl:
+            self._internet_cache = _internet()
+            self._internet_last_check = now
+        return self._internet_cache
 
     def snapshot(self, context: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         with self.lock:
@@ -183,7 +196,7 @@ class SystemMonitor:
                 "disk": _disk(),
                 "storage": _storage(),
                 "network": _network(),
-                "internet": _internet(),
+                "internet": self._internet_cached(),
                 "temperature": _temperature(),
                 "gpu": _gpu(),
                 "power": _power(),
@@ -227,6 +240,11 @@ class SystemMonitor:
         self._stop.clear()
         self._thread = threading.Thread(target=self._collect_loop, daemon=True)
         self._thread.start()
+        # Daemon thread still lingers if the ledger is dropped without
+        # explicit stop() — register an idempotent atexit shutdown.
+        import atexit
+
+        atexit.register(self.stop)
 
     def stop(self) -> None:
         self._stop.set()

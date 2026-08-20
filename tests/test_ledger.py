@@ -478,10 +478,13 @@ class TestKwargStripping:
         from tokenledger.core.interceptor import InterceptionLayer
         il = InterceptionLayer.__new__(InterceptionLayer)
         kwargs = {"model": "gpt-4", "messages": [], "user_id": "alice", "project_id": "my-app"}
-        il._strip_tracking_kwargs(kwargs)
-        assert "user_id" not in kwargs
-        assert "project_id" not in kwargs
-        assert "model" in kwargs
+        stripped = il._strip_tracking_kwargs(kwargs)
+        assert "user_id" not in stripped
+        assert "project_id" not in stripped
+        assert "model" in stripped
+        # The caller's dict must remain untouched (reusable across calls)
+        assert "user_id" in kwargs
+        assert "project_id" in kwargs
 
 
 class TestTokenBucket:

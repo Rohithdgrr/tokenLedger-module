@@ -8,6 +8,12 @@ from typing import Any
 
 from ..core.store import StorageBackend
 
+_DEFAULT_CSV_KEYS = [
+    "record_id", "timestamp", "provider", "model",
+    "input_tokens", "output_tokens", "total_tokens", "cost_usd",
+    "latency_ms", "user_id", "project_id", "status", "source",
+]
+
 
 class ExportEngine:
     """Handles export of records to various formats."""
@@ -16,9 +22,10 @@ class ExportEngine:
         self.store = store
 
     def export_csv(self, filepath: str, records: list[dict[str, Any]]) -> None:
-        keys = self._ordered_keys(records[0]) if records else ["record_id", "timestamp", "provider", "model",
-                 "input_tokens", "output_tokens", "total_tokens", "cost_usd",
-                 "latency_ms", "user_id", "project_id", "status", "source"]
+        # Guard against records with no keys (or non-dict entries) — pick the
+        # first non-empty dict for the column set, fall back to defaults.
+        sample = next((r for r in records if isinstance(r, dict) and r), None)
+        keys = self._ordered_keys(sample) if sample else list(_DEFAULT_CSV_KEYS)
         with open(filepath, "w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
             writer.writeheader()

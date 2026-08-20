@@ -1020,7 +1020,9 @@ class TestCoverageGaps:
                      "wrap_together", "wrap_perplexity", "wrap_groq"):
             getattr(ledger, name)(client)
         client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
-        assert len(ledger.get_records()) >= 11  # each wrap chains a tracked fn
+        # Wrapping is idempotent per target — N wraps still record exactly once
+        # (chained tracked fns would double-record and clobber the original).
+        assert len(ledger.get_records()) == 1
 
         an = MagicMock()
         an.messages.create = MagicMock(
@@ -1046,7 +1048,8 @@ class TestCoverageGaps:
         )
         ledger.wrap_cohere(co)
         co.v2.chat(model="command-r", messages=[{"role": "user", "content": "hi"}])
-        assert len(ledger.get_records()) >= 14
+        # openai (1) + anthropic + gemini + ollama + cohere: 5 tracked calls
+        assert len(ledger.get_records()) == 5
 
     # ── interceptor: bucket / async / circuit / stream edges ───────────
 

@@ -65,10 +65,13 @@ class TestMultiTenant:
         from tokenledger.core.interceptor import InterceptionLayer
         il = InterceptionLayer.__new__(InterceptionLayer)
         kwargs = {"model": "gpt-4", "tenant_id": "acme", "user_id": "bob"}
-        il._strip_tracking_kwargs(kwargs)
-        assert "tenant_id" not in kwargs
-        assert "user_id" not in kwargs
-        assert "model" in kwargs
+        stripped = il._strip_tracking_kwargs(kwargs)
+        assert "tenant_id" not in stripped
+        assert "user_id" not in stripped
+        assert "model" in stripped
+        # Caller's dict is never mutated (reusable kwargs across calls)
+        assert "tenant_id" in kwargs
+        assert "user_id" in kwargs
 
 
 class TestVerifierPlugins:

@@ -7,7 +7,12 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from tokenledger.core.store import StorageBackend, _is_billable
+from tokenledger.core.store import (
+    StorageBackend,
+    _is_billable,
+    checksum_matches,
+    normalize_ts,
+)
 
 
 class SqliteStore(StorageBackend):
@@ -80,6 +85,8 @@ class SqliteStore(StorageBackend):
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_tenant ON records(tenant_id)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_conversation ON records(conversation_id)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_agent ON records(agent_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_project ON records(project_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_model ON records(model)")
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS budgets (
                         key TEXT PRIMARY KEY,
@@ -143,12 +150,12 @@ class SqliteStore(StorageBackend):
                     INSERT OR REPLACE INTO records
                     (record_id, timestamp, provider, model, input_tokens, output_tokens,
                      total_tokens, cost_usd, latency_ms, user_id, project_id, status, source,
-                     conversation_id, agent_id, prompt_hash, tenant_id, extra)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     conversation_id, agent_id, prompt_hash, tenant_id, _checksum, extra)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record.get("record_id"),
-                    record.get("timestamp"),
+                    normalize_ts(record.get("timestamp")),
                     record.get("provider"),
                     record.get("model"),
                     record.get("input_tokens", 0),
@@ -164,6 +171,7 @@ class SqliteStore(StorageBackend):
                     record.get("agent_id"),
                     record.get("prompt_hash"),
                     record.get("tenant_id"),
+                    record.get("_checksum"),
                     json.dumps(extra, default=str) if extra else None,
                 ),
             )
@@ -190,7 +198,7 @@ class SqliteStore(StorageBackend):
                         """,
                         (
                             record.get("record_id"),
-                            record.get("timestamp"),
+                            normalize_ts(record.get("timestamp")),
                             record.get("provider"),
                             record.get("model"),
                             record.get("input_tokens", 0),
@@ -285,6 +293,14 @@ class SqliteStore(StorageBackend):
         with self.lock:
             return self.budgets.get(f"{scope}:{scope_id}")
 
+    def delete_budget(self, scope: str, scope_id: str) -> None:
+        key = f"{scope}:{scope_id}"
+        with self.lock:
+            self.budgets.pop(key, None)
+            conn = self._conn()
+            conn.execute("DELETE FROM budgets WHERE key = ?", (key,))
+            conn.commit()
+
     def get_all_budgets(self) -> dict[str, dict[str, Any]]:
         with self.lock:
             return dict(self.budgets)
@@ -292,16 +308,10 @@ class SqliteStore(StorageBackend):
     def verify_immutability(self) -> list[str]:
         tampered = []
         for r in self.get_records():
-            expected = r.get("_checksum", "")
-            if not expected:
+            if not r.get("_checksum"):
                 continue
-            if "_checksum" in r:
-                raw = json.dumps({k: v for k, v in r.items() if k != "_checksum"}, sort_keys=True, default=str).encode()
-                import hashlib
-
-                actual = hashlib.sha256(raw).hexdigest()
-                if expected != actual:
-                    tampered.append(r.get("record_id", "unknown"))
+            if not checksum_matches(r):
+                tampered.append(r.get("record_id", "unknown"))
         return tampered
 
     def clear(self) -> None:
@@ -317,7 +327,10 @@ class SqliteStore(StorageBackend):
         """Remove records older than ``max_age_days`` (default 90) and cap
         the table at ``max_records`` newest rows."""
         days = max_age_days if max_age_days is not None else 90
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        # All timestamps are stored as naive UTC, so the naive cutoff
+        # compares correctly with plain string comparison.
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=days)
+        cutoff = cutoff_dt.replace(tzinfo=None).isoformat()
         with self.lock:
             before = self.get_record_count()
             conn = self._conn()
@@ -343,6 +356,7 @@ class SqliteStore(StorageBackend):
         scope_id = budget.get("scope_id", "")
         # Build WHERE clauses that can use indexes; _ghost/blocked filtered in Python
         # because _ghost lives in the extra JSON column.
+        window_start = normalize_ts(window_start)
         conditions = ["timestamp >= ?", "status NOT IN ('blocked','error')"]
         params: list[Any] = [window_start]
         if scope == "project":
@@ -368,6 +382,12 @@ class SqliteStore(StorageBackend):
             params.append(scope_id)
         elif scope == "tenant":
             conditions.append("tenant_id = ?")
+            params.append(scope_id)
+        elif scope == "conversation":
+            conditions.append("conversation_id = ?")
+            params.append(scope_id)
+        elif scope == "agent":
+            conditions.append("agent_id = ?")
             params.append(scope_id)
         # global scope: no extra filter
         sql = f"SELECT cost_usd, extra FROM records WHERE {' AND '.join(conditions)}"

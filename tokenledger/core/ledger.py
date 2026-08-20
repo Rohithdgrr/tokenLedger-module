@@ -9,7 +9,6 @@ import json
 import math
 import secrets
 import time
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Literal, TypeVar
 
 if TYPE_CHECKING:
@@ -47,6 +46,7 @@ from .extractor import TokenExtractor
 from .interceptor import InterceptionLayer, UnknownModelError
 from .pricing import PricingRegistry
 from .record import build_record
+from .scopes import matches_scope
 from .store import MemoryStore, StorageBackend
 from .system import SystemMonitor
 from .verifier import VerificationEngine
@@ -86,6 +86,11 @@ class _UsageContext:
             inp, out = est["input_tokens"], est["output_tokens"]
         else:
             inp = out = 0
+        kwargs = dict(self._kwargs)
+        if status != "success":
+            # Error records must not mask the original exception with
+            # post-hoc budget enforcement failures.
+            kwargs["_skip_budget_check"] = True
         self._ledger.record_usage(
             provider=self._provider,
             model=self._model,
@@ -94,7 +99,7 @@ class _UsageContext:
             latency_ms=latency,
             status=status,
             source="usage_block",
-            **self._kwargs,
+            **kwargs,
         )
 
     def __enter__(self) -> _UsageContext:
@@ -123,7 +128,14 @@ class _UsageContext:
 
 
 class TokenLedger:
-    """Lightweight governance layer for LLM usage tracking."""
+    """Lightweight governance layer for LLM usage tracking.
+
+    Args:
+        system_monitor: Optional :class:`SystemMonitor`. If provided, you must
+            call ``system_monitor.start()`` to begin background collection;
+            otherwise :meth:`record_usage(system_context=True)` will return a
+            single snapshot with potentially stale/missing fields.
+    """
 
     def __init__(
         self,
@@ -140,6 +152,12 @@ class TokenLedger:
         strict_budget: bool = False,
         ghost_persist: bool = True,
     ):
+        if unknown_model_policy not in ("block", "allow", "estimate"):
+            raise ValueError(
+                f"unknown_model_policy must be 'block', 'allow', or 'estimate', got {unknown_model_policy!r}"
+            )
+        if differential_privacy_epsilon is not None and differential_privacy_epsilon <= 0:
+            raise ValueError("differential_privacy_epsilon must be positive (or None to disable)")
         self.store = store or MemoryStore(
             persist_path=persist_path,
             max_records=max_records,
@@ -256,18 +274,34 @@ class TokenLedger:
                 @functools.wraps(func)
                 async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
                     start = time.monotonic()
-                    result = await func(*args, **kwargs)
-                    self._record_decorated(provider, model, user_id, project_id, result, start, tracking_kwargs)
-                    return result
+                    try:
+                        result = await func(*args, **kwargs)
+                        self._record_decorated(provider, model, user_id, project_id, result, start, tracking_kwargs)
+                        return result
+                    except Exception as e:
+                        self._record_decorated(
+                            provider, model, user_id, project_id,
+                            {"_error": str(e), "_error_type": type(e).__name__},
+                            start, tracking_kwargs, status="error",
+                        )
+                        raise
 
                 return async_wrapper
 
             @functools.wraps(func)
             def wrapper(*args: Any, **kwargs: Any) -> Any:
                 start = time.monotonic()
-                result = func(*args, **kwargs)
-                self._record_decorated(provider, model, user_id, project_id, result, start, tracking_kwargs)
-                return result
+                try:
+                    result = func(*args, **kwargs)
+                    self._record_decorated(provider, model, user_id, project_id, result, start, tracking_kwargs)
+                    return result
+                except Exception as e:
+                    self._record_decorated(
+                        provider, model, user_id, project_id,
+                        {"_error": str(e), "_error_type": type(e).__name__},
+                        start, tracking_kwargs, status="error",
+                    )
+                    raise
 
             return wrapper
 
@@ -282,6 +316,7 @@ class TokenLedger:
         result: Any,
         start: float,
         tracking_kwargs: dict[str, Any],
+        status: str = "success",
     ) -> None:
         inp = tracking_kwargs.get("input_tokens", 0) or 0
         out = tracking_kwargs.get("output_tokens", 0) or 0
@@ -300,6 +335,7 @@ class TokenLedger:
             input_tokens=inp,
             output_tokens=out,
             latency_ms=latency_ms,
+            status=status,
             **rest,
         )
 
@@ -325,6 +361,7 @@ class TokenLedger:
         media_type: str | None = None,
         cache_hit: bool = False,
         status: str = "success",
+        _skip_budget_check: bool = False,
     ) -> dict[str, Any]:
         if system_context and not self.system_monitor:
             raise ValueError("system_context=True requires a SystemMonitor instance")
@@ -374,6 +411,9 @@ class TokenLedger:
                 model=model,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                tenant_id=tenant_id or "",
+                conversation_id=conversation_id or "",
+                agent_id=agent_id or "",
             )
         except BudgetExceededError:
             if self.ghost_mode:
@@ -392,29 +432,52 @@ class TokenLedger:
                 self.interceptor.on_record(verified)
             return verified
 
-        self.store.insert_record(verified)
+        try:
+            self.store.insert_record(verified)
+        except Exception as e:
+            # Best-effort persistence: recording must never break business logic.
+            import logging
+
+            logging.getLogger(__name__).error("Failed to persist usage record: %s", e)
+            verified["_store_error"] = str(e)
         if self.interceptor.on_record:
             self.interceptor.on_record(verified)
-        # Post-hoc strict budget enforcement: actual cost may exceed estimate
-        if self.strict_budget and not verified.get("_ghost") and verified.get("status") not in ("blocked", "error"):
-            try:
-                # Re-check with actual tokens; budget_enforcer will raise if over
-                # We use a small grace threshold (e.g., 5%) to avoid flapping
-                for _key, b in self.store.get_all_budgets().items():
+        # Cost contracts (differentiator) — previously dead code, now enforced
+        try:
+            for contract in self.cost_contracts.all():
+                if not self.cost_contracts.check(contract.name, float(verified.get("cost_usd", 0) or 0)):
+                    verified["contract_breached"] = contract.name
+                    break
+        except Exception:
+            pass
+        # Post-hoc strict budget enforcement: actual cost may exceed estimate.
+        # Applies to budgets matching this record's scope only.
+        if self.strict_budget and not _skip_budget_check and verified.get("status") not in ("blocked", "error"):
+            for _key, b in self.store.get_all_budgets().items():
+                if not matches_scope(verified, b.get("scope", "global"), b.get("scope_id", "all")):
+                    continue
+                try:
+                    # Re-check with actual tokens; budget_enforcer will raise if over
+                    # We use a small grace threshold (e.g., 5%) to avoid flapping
                     spend = self.budget_enforcer._calculate_current_spend(b)  # after insert, includes this record
                     limit = float(b.get("limit_usd", 0))
                     if limit and spend > limit * 1.05:
+                        err = BudgetExceededError(
+                            f"Post-hoc budget overrun: ${spend:.4f} > ${limit:.4f}",
+                            b.get("scope", ""),
+                            b.get("scope_id", ""),
+                            spend,
+                            limit,
+                        )
                         verified["budget_overrun"] = True
                         if self.interceptor.on_budget_exceeded:
-                            # Synthesize an error for callback compatibility
-                            from .exceptions import BudgetExceededError as _BEE
-
-                            self.interceptor.on_budget_exceeded(
-                                _BEE(f"Post-hoc budget overrun: ${spend:.4f} > ${limit:.4f}", b.get("scope",""), b.get("scope_id",""), spend, limit)
-                            )
-                        break
-            except Exception:
-                pass
+                            self.interceptor.on_budget_exceeded(err)
+                        if not verified.get("_ghost"):
+                            raise err
+                except BudgetExceededError:
+                    raise
+                except Exception:
+                    pass
         return verified
 
     def _add_noise(self, record: dict[str, Any]) -> dict[str, Any]:
@@ -435,9 +498,17 @@ class TokenLedger:
         return record
 
     def _dp_records(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Return noise-applied copies when differential privacy is enabled."""
+        """Return noise-applied copies when differential privacy is enabled.
+
+        .. deprecated::
+            Per-record DP noise compounds on aggregation. Prefer
+            ``get_summary(apply_dp=True)`` for aggregate DP.
+        """
         if not self.differential_privacy_epsilon:
             return records
+        import logging
+
+        logging.getLogger(__name__).warning("Per-record DP noise compounds on aggregation. Use apply_dp on summaries instead.")
         return [self._add_noise(dict(r)) for r in records]
 
     @staticmethod
@@ -635,20 +706,8 @@ class TokenLedger:
         return self.local_models.estimate_cost(name, input_tokens, output_tokens)
 
     def _match_scope(self, record: dict[str, Any], scope: str, scope_id: str) -> bool:
-        if scope == "global":
-            return True
-        if scope == "provider":
-            return bool(record.get("provider") == scope_id)
-        if scope == "model":
-            return bool(record.get("model") == scope_id)
-        if scope == "user":
-            return bool(record.get("user_id", "anonymous") == scope_id)
-        if scope == "project":
-            return bool(record.get("project_id", "default") == scope_id)
-        if scope == "conversation":
-            return bool(record.get("conversation_id") == scope_id)
-        if scope == "agent":
-            return bool(record.get("agent_id") == scope_id)
-        if scope == "tenant":
-            return bool(record.get("tenant_id") == scope_id)
-        return False
+        return matches_scope(record, scope, scope_id)
+
+    def delete_budget(self, scope: str, scope_id: str) -> None:
+        """Remove a budget rule (and its persisted row, for SQLite backends)."""
+        self.store.delete_budget(scope, scope_id)

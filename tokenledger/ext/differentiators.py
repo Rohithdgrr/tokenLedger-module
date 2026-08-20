@@ -5,6 +5,7 @@ import difflib
 import hashlib
 import hmac
 import json
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -147,10 +148,12 @@ class ModelRouter:
             ]
         if not candidates:
             return None
-        def key_fn(o):
-            return o.latency_p95_ms if (prefer_latency and o.latency_p95_ms is not None) else (
-                o.input_cost_per_1k * input_tokens + o.output_cost_per_1k * output_tokens
-            )
+
+        def key_fn(o: RouteOption) -> float:
+            if prefer_latency and o.latency_p95_ms is not None:
+                return float(o.latency_p95_ms)
+            return (o.input_cost_per_1k * input_tokens / 1000) + (o.output_cost_per_1k * output_tokens / 1000)
+
         return min(candidates, key=key_fn)
 
 
@@ -165,38 +168,47 @@ class CostContract:
 
 
 class CostContractRegistry:
+    """Thread-safe registry of cost contracts."""
+
     def __init__(self):
         self._contracts: dict[str, CostContract] = {}
+        self._lock = threading.Lock()
 
     def add(self, contract: CostContract) -> None:
-        self._contracts[contract.name] = contract
+        with self._lock:
+            self._contracts[contract.name] = contract
 
     def get(self, name: str) -> CostContract | None:
-        return self._contracts.get(name)
+        with self._lock:
+            return self._contracts.get(name)
 
     def check(self, name: str, cost_usd: float) -> bool:
-        contract = self._contracts.get(name)
-        if not contract:
+        with self._lock:
+            contract = self._contracts.get(name)
+            if not contract:
+                return True
+            contract.current_spend += cost_usd
+            if contract.current_spend > contract.max_cost_usd:
+                if contract.callback:
+                    contract.callback(contract)
+                return False
             return True
-        contract.current_spend += cost_usd
-        if contract.current_spend > contract.max_cost_usd:
-            if contract.callback:
-                contract.callback(contract)
-            return False
-        return True
 
     def reset(self, name: str) -> None:
-        c = self._contracts.get(name)
-        if c:
-            c.current_spend = 0.0
+        with self._lock:
+            c = self._contracts.get(name)
+            if c:
+                c.current_spend = 0.0
 
     def all(self) -> list[CostContract]:
-        return list(self._contracts.values())
+        with self._lock:
+            return list(self._contracts.values())
 
 
 class PromptEvolutionTracker:
-    def __init__(self):
+    def __init__(self, max_history: int = 100):
         self._versions: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        self._max_history = max_history
 
     def track(self, name: str, content: str, metadata: dict | None = None) -> dict[str, Any]:
         history = self._versions[name]
@@ -212,6 +224,9 @@ class PromptEvolutionTracker:
             prev = history[-1]["content"]
             entry["diff"] = list(difflib.unified_diff(prev.splitlines(), content.splitlines(), lineterm=""))
         history.append(entry)
+        if len(history) > self._max_history:
+            # Bounded in-memory history — drop oldest versions first.
+            del history[: len(history) - self._max_history]
         return entry
 
     def get_history(self, name: str) -> list[dict[str, Any]]:
@@ -225,14 +240,24 @@ class PromptEvolutionTracker:
 @dataclass
 class LocalModelCost:
     name: str
-    watts_per_second: float = 10.0
+    power_watts: float = 10.0  # instantaneous power during inference
     cost_per_kwh: float = 0.12
     tokens_per_second: float = 30.0
     hardware_cost: float = 0.0
+    # Back-compat alias — keep accepting watts_per_second
+    watts_per_second: float | None = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        # Support legacy kwarg watts_per_second
+        if self.watts_per_second is not None:
+            self.power_watts = float(self.watts_per_second)
 
     def cost_per_token(self) -> float:
-        energy_per_token = self.watts_per_second / self.tokens_per_second
-        return (energy_per_token / 3_600_000) * self.cost_per_kwh
+        # Time per token = 1 / tokens_per_second (s)
+        # Energy per token (Ws) = power_watts * time_per_token
+        # kWh per token = Ws / 3_600_000
+        energy_ws = self.power_watts / self.tokens_per_second
+        return (energy_ws / 3_600_000) * self.cost_per_kwh
 
     def cost_for_tokens(self, input_tokens: int, output_tokens: int) -> float:
         return (input_tokens + output_tokens) * self.cost_per_token()

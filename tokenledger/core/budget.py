@@ -9,7 +9,8 @@ from typing import Any, Optional
 
 from .exceptions import BudgetExceededError
 from .pricing import PricingRegistry
-from .store import StorageBackend
+from .scopes import matches_scope
+from .store import StorageBackend, normalize_ts
 
 # Re-export for backwards compatibility
 __all__ = ["BudgetExceededError"]
@@ -38,11 +39,16 @@ class BudgetEnforcer:
         input_tokens: int = 0,
         output_tokens: int = 0,
         max_tokens: Optional[int] = None,
+        tenant_id: str = "",
+        conversation_id: str = "",
+        agent_id: str = "",
     ) -> bool:
         """Check if the request is within budget."""
         if not self.store.get_all_budgets():
             return True
-        applicable_budgets = self._get_applicable_budgets(user_id, project_id)
+        applicable_budgets = self._get_applicable_budgets(
+            user_id, project_id, provider, model, tenant_id, conversation_id, agent_id
+        )
 
         for budget_key, budget in applicable_budgets:
             current_spend = self._calculate_current_spend(budget)
@@ -63,16 +69,34 @@ class BudgetEnforcer:
 
         return True
 
-    def _get_applicable_budgets(self, user_id: str, project_id: str) -> list[tuple]:
+    def _get_applicable_budgets(
+        self,
+        user_id: str,
+        project_id: str,
+        provider: str = "",
+        model: str = "",
+        tenant_id: str = "",
+        conversation_id: str = "",
+        agent_id: str = "",
+    ) -> list[tuple]:
         """Find all budget rules that apply to this request."""
         budgets = []
         scope_keys = [
             ("global", "all"),
+            ("provider", provider),
+            ("model", model),
             ("project", project_id),
             ("user", user_id),
             ("user_project", f"{user_id}:{project_id}"),
+            ("tenant", tenant_id),
         ]
+        if conversation_id:
+            scope_keys.append(("conversation", conversation_id))
+        if agent_id:
+            scope_keys.append(("agent", agent_id))
         for scope, scope_id in scope_keys:
+            if not scope_id:
+                continue
             budget = self.store.get_budget(scope, scope_id)
             if budget:
                 budgets.append((f"{scope}:{scope_id}", budget))
@@ -100,6 +124,13 @@ class BudgetEnforcer:
             return round(float(totals.get("cost_usd", 0)), 10)
 
         window_start = self._get_window_start(reset_cycle)
+        # Normalize window_start to aware datetime for robust comparison
+        try:
+            ws_dt = datetime.fromisoformat(window_start.replace("Z", "+00:00"))
+            if ws_dt.tzinfo is None:
+                ws_dt = ws_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            ws_dt = None
         # Try store-optimized path first
         if hasattr(self.store, "get_windowed_spend"):
             try:
@@ -109,9 +140,21 @@ class BudgetEnforcer:
             except Exception:
                 pass
         total = 0.0
+        ws_norm = normalize_ts(window_start)
         for record in self.store.get_records():
             ts = record.get("timestamp", "")
-            if ts and ts < window_start:
+            if ts and ws_dt is not None:
+                try:
+                    ts_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    if ts_dt.tzinfo is None:
+                        ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+                    if ts_dt < ws_dt:
+                        continue
+                except Exception:
+                    # Fallback to string compare if parsing fails
+                    if ts and normalize_ts(ts) < ws_norm:
+                        continue
+            elif ts and normalize_ts(ts) < ws_norm:
                 continue
             if record.get("status") in ("blocked", "error") or record.get("_ghost"):
                 continue
@@ -123,6 +166,9 @@ class BudgetEnforcer:
     def _get_window_start(self, reset_cycle: str) -> str:
         """Get the start of the current budget window."""
         now = datetime.now(timezone.utc)
+        if reset_cycle == "never":
+            # datetime.min is already naive — keep it as-is.
+            return datetime.min.isoformat()
         if reset_cycle == "daily":
             start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         elif reset_cycle == "weekly":
@@ -132,27 +178,15 @@ class BudgetEnforcer:
             )
         elif reset_cycle == "monthly":
             start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        elif reset_cycle == "never":
-            start = datetime.min
         else:
             start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        return start.isoformat()
+        # Naive UTC: window starts are always computed in UTC, and strings
+        # must compare correctly against normalized naively-stored timestamps.
+        return start.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
 
     def _record_matches_budget(self, record: dict[str, Any], budget: dict[str, Any]) -> bool:
         """Check if a historical record falls under a budget's scope."""
-        scope = budget.get("scope", "global")
-        scope_id = budget.get("scope_id", "")
-        if scope == "global":
-            return True
-        if scope == "project":
-            return bool(record.get("project_id", "default") == scope_id)
-        if scope == "user":
-            return bool(record.get("user_id", "anonymous") == scope_id)
-        if scope == "user_project":
-            parts = scope_id.split(":")
-            if len(parts) == 2:
-                return bool(record.get("user_id") == parts[0] and record.get("project_id") == parts[1])
-        return False
+        return matches_scope(record, budget.get("scope", "global"), budget.get("scope_id", ""))
 
     def _estimate_request_cost(
         self,
@@ -163,6 +197,14 @@ class BudgetEnforcer:
         output_tokens: int = 0,
         max_tokens: Optional[int] = None,
     ) -> float:
+        """Estimate request cost for pre-flight checks.
+
+        .. note::
+            ``max_tokens`` is treated as an output-side cap; APIs that count
+            ``max_tokens`` toward total context length (input + output) may
+            be underestimated here. Estimates are only used for pre-flight
+            gating — actual spend always comes from verified records.
+        """
         pricing = self.pricing.get_pricing(provider, model)
 
         if input_tokens or output_tokens:

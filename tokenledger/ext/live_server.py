@@ -44,7 +44,9 @@ class LiveServer:
         self._lock = threading.Lock()
         self._httpd: Optional[_ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
-        self._original_on_record: Optional[Callable[[dict[str, Any]], None]] = ledger.interceptor.on_record
+        # Captured at start() (not __init__) so components that hook
+        # on_record between construction and start() are preserved.
+        self._original_on_record: Optional[Callable[[dict[str, Any]], None]] = None
 
         def _on_record(record: dict[str, Any]) -> None:
             self._publish(record)
@@ -58,6 +60,7 @@ class LiveServer:
     def start(self) -> "LiveServer":
         if self._httpd is not None:
             return self
+        self._original_on_record = self.ledger.interceptor.on_record
         self.ledger.interceptor.on_record = self._on_record
         try:
             self._httpd = _ThreadingHTTPServer((self.host, self.port), _make_handler(self))
@@ -119,8 +122,8 @@ class LiveServer:
             "providers": self.ledger.get_spending_by_provider(),
             "running_totals": {
                 key: totals
-                for key, totals in self.ledger.store.running_totals.items()
-                if key in ("global:all",)
+                for key, totals in self.ledger.store.list_running_totals()
+                if key == "global:all"
             },
             "generated_at": summary.get("generated_at", ""),
         }

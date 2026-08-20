@@ -49,15 +49,19 @@ class TokenExtractor:
         return parser(response)
 
     def _parse_openai(self, response: Any) -> Optional[dict[str, Any]]:
-        """Parse OpenAI response usage."""
+        """Parse OpenAI response usage (incl. ``prompt_tokens_details.cached_tokens``)."""
         try:
             usage = response.usage
             if usage is None:
                 return None
+            details = getattr(usage, "prompt_tokens_details", None)
+            cached = int(getattr(details, "cached_tokens", 0) or 0) if details else 0
             return {
                 "input_tokens": getattr(usage, "prompt_tokens", 0),
                 "output_tokens": getattr(usage, "completion_tokens", 0),
                 "total_tokens": getattr(usage, "total_tokens", 0),
+                "cached_input_tokens": cached,
+                "cache_hit": cached > 0,
                 "source": "api_reported",
             }
         except AttributeError:
@@ -86,10 +90,13 @@ class TokenExtractor:
             metadata = response.usage_metadata
             if metadata is None:
                 return None
+            cached = int(getattr(metadata, "cached_content_token_count", 0) or 0)
             return {
                 "input_tokens": getattr(metadata, "prompt_token_count", 0),
                 "output_tokens": getattr(metadata, "candidates_token_count", 0),
                 "total_tokens": getattr(metadata, "total_token_count", 0),
+                "cached_input_tokens": cached,
+                "cache_hit": cached > 0,
                 "source": "api_reported",
             }
         except AttributeError:
@@ -169,10 +176,14 @@ class TokenExtractor:
         try:
             usage = getattr(response, "usage", None)
             if usage:
+                details = getattr(usage, "prompt_tokens_details", None)
+                cached = int(getattr(details, "cached_tokens", 0) or 0) if details else 0
                 return {
                     "input_tokens": getattr(usage, "prompt_tokens", getattr(usage, "input_tokens", 0)),
                     "output_tokens": getattr(usage, "completion_tokens", getattr(usage, "output_tokens", 0)),
                     "total_tokens": getattr(usage, "total_tokens", 0),
+                    "cached_input_tokens": cached,
+                    "cache_hit": cached > 0,
                     "source": "api_reported",
                 }
             return None

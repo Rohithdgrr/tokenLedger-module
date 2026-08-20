@@ -120,6 +120,9 @@ def _build_ledger(args: Any) -> Any:
     kwargs = {}
     if args.file:
         kwargs["persist_path"] = args.file
+    key = getattr(args, "key", None)
+    if key:
+        kwargs["encryption_key"] = key
     return TokenLedger(**kwargs)
 
 
@@ -501,6 +504,7 @@ def _export_interactive(args: Any, ledger: Any) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(prog="tokenledger", description="LLM usage tracking CLI")
     parser.add_argument("--file", "-f", help="Path to JSONL persist file")
+    parser.add_argument("--key", "-k", metavar="KEY", help="Encryption key for the persist file (AES)")
     parser.add_argument("--interactive", "-i", action="store_true", help="Force interactive mode")
 
     sub = parser.add_subparsers(dest="command")

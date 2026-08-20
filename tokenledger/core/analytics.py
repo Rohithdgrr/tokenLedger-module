@@ -6,6 +6,7 @@ Pure Python queries with O(1) lookups via running totals.
 from collections import Counter
 from typing import Any, Optional
 
+from .scopes import matches_scope
 from .store import StorageBackend
 
 
@@ -57,25 +58,22 @@ class AnalyticsEngine:
 
         budget_utilization = {}
         for bk, b in budgets.items():
-            spend = self.store.get_running_totals(b.get('scope', 'global'), b.get('scope_id', 'all'))
+            spend = self._budget_spend(b)
             limit = b.get("limit_usd", 0)
             budget_utilization[bk] = {
-                "spend": round(spend.get("cost_usd", 0), 6),
+                "spend": round(spend, 6),
                 "limit": limit,
-                "utilization_pct": round(spend.get("cost_usd", 0) / limit * 100, 2) if limit else 0,
+                "utilization_pct": round(spend / limit * 100, 2) if limit else 0,
             }
         base["budget_utilization"] = budget_utilization
 
-        running = self.store.running_totals
         model_aggs = [
             {"model": key[len("model:"):], **agg}
-            for key, agg in running.items()
-            if key.startswith("model:")
+            for key, agg in self.store.list_running_totals("model:")
         ]
         provider_aggs = [
             {"provider": key[len("provider:"):], **agg}
-            for key, agg in running.items()
-            if key.startswith("provider:")
+            for key, agg in self.store.list_running_totals("provider:")
         ]
         base["top_models"] = [
             {"model": m["model"], "tokens": m["total_tokens"]}
@@ -98,14 +96,9 @@ class AnalyticsEngine:
 
     def get_spending_by_dimension(self, dimension: str) -> list[dict[str, Any]]:
         """Get spending breakdown by a dimension."""
-        results = []
         prefix = f"{dimension}:"
-
-        all_totals = self.store.running_totals
-        for key, agg in all_totals.items():
-            if key.startswith(prefix):
-                results.append({"id": key[len(prefix):], **agg})
-
+        all_totals = self.store.list_running_totals(prefix)
+        results = [{"id": key[len(prefix):], **agg} for key, agg in all_totals]
         return sorted(results, key=lambda x: x.get("cost_usd", 0), reverse=True)
 
     def get_trend(self, dimension: str, dimension_id: str, granularity: str = "day") -> list[dict[str, Any]]:
@@ -170,66 +163,78 @@ class AnalyticsEngine:
         latencies.sort()
         n = len(latencies)
 
+        def _percentile(sorted_vals: list[float], p: float) -> float:
+            if not sorted_vals:
+                return 0.0
+            import math
+
+            k = (len(sorted_vals) - 1) * p / 100
+            f = math.floor(k)
+            c = math.ceil(k)
+            if f == c:
+                return float(sorted_vals[int(k)])
+            return float(sorted_vals[f] * (c - k) + sorted_vals[c] * (k - f))
+
         return {
             "count": n,
             "min": round(latencies[0], 2),
             "max": round(latencies[-1], 2),
             "avg": round(sum(latencies) / n, 2),
-            "p50": round(latencies[int(n * 0.5)], 2),
-            "p95": round(latencies[int(n * 0.95)] if n * 0.95 < n else latencies[-1], 2),
-            "p99": round(latencies[int(n * 0.99)] if n * 0.99 < n else latencies[-1], 2),
+            "p50": round(_percentile(latencies, 50), 2),
+            "p95": round(_percentile(latencies, 95), 2),
+            "p99": round(_percentile(latencies, 99), 2),
         }
+
+    def _budget_spend(self, budget: dict[str, Any]) -> float:
+        """Spend inside a budget's reset window (window-aware utilization).
+
+        ``never`` budgets use running totals (O(1)); daily/weekly/monthly
+        budgets use the store's indexed windowed spend when available.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        from .store import normalize_ts
+
+        scope = budget.get("scope", "global")
+        scope_id = budget.get("scope_id", "all")
+        reset_cycle = budget.get("reset_cycle", "monthly")
+        if reset_cycle == "never":
+            totals = self.store.get_running_totals(scope, scope_id)
+            return round(float(totals.get("cost_usd", 0)), 6)
+        now = datetime.now(timezone.utc)
+        if reset_cycle == "daily":
+            window_start_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        elif reset_cycle == "weekly":
+            window_start_dt = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            window_start_dt = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        window_start: str = window_start_dt.isoformat()
+        if hasattr(self.store, "get_windowed_spend"):
+            try:
+                optimized = self.store.get_windowed_spend(budget, window_start)
+                if optimized is not None:
+                    return round(float(optimized), 6)
+            except Exception:
+                pass
+        ws_norm = normalize_ts(window_start)
+        total = 0.0
+        for record in self.store.get_records():
+            ts = record.get("timestamp", "")
+            if ts and normalize_ts(ts) < ws_norm:
+                continue
+            if record.get("status") in ("blocked", "error") or record.get("_ghost"):
+                continue
+            if matches_scope(record, scope, scope_id):
+                total += float(record.get("cost_usd", 0) or 0)
+        return round(total, 6)
 
     def get_budget_utilization(self, scope: str, scope_id: str) -> Optional[dict[str, Any]]:
         """Get current budget utilization percentage (window-aware)."""
-        from datetime import datetime, timedelta, timezone
-
         budget = self.store.get_budget(scope, scope_id)
         if not budget:
             return None
 
-        # Respect reset_cycle window; fall back to full history for 'never'
-        reset_cycle = budget.get("reset_cycle", "monthly")
-        window_start: Optional[str] = None
-        if reset_cycle != "never":
-            now = datetime.now(timezone.utc)
-            if reset_cycle == "daily":
-                window_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-            elif reset_cycle == "weekly":
-                window_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-            elif reset_cycle == "monthly":
-                window_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
-            else:
-                window_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
-            # Try optimized store path
-            if hasattr(self.store, "get_windowed_spend"):
-                try:
-                    optimized = self.store.get_windowed_spend(budget, window_start)  # type: ignore[operator]
-                    if optimized is not None:
-                        total_spent = float(optimized)
-                        limit = budget.get("limit_usd", 0)
-                        utilization = (total_spent / limit * 100) if limit > 0 else 0
-                        return {
-                            "scope": scope,
-                            "scope_id": scope_id,
-                            "limit_usd": limit,
-                            "spent_usd": round(total_spent, 4),
-                            "remaining_usd": round(limit - total_spent, 4),
-                            "utilization_percent": round(utilization, 2),
-                            "reset_cycle": reset_cycle,
-                        }
-                except Exception:
-                    pass
-
-        total_spent = 0.0
-        for record in self.store.get_records():
-            if window_start and record.get("timestamp", "") < window_start:
-                continue
-            if record.get("status") in ("blocked", "error") or record.get("_ghost"):
-                continue
-            if self._matches_budget_scope(record, budget):
-                total_spent += record.get("cost_usd", 0)
-
+        total_spent = self._budget_spend(budget)
         limit = budget.get("limit_usd", 0)
         utilization = (total_spent / limit * 100) if limit > 0 else 0
 
@@ -283,43 +288,8 @@ class AnalyticsEngine:
 
     def _matches_dimension(self, record: dict[str, Any], dimension: str, dimension_id: str) -> bool:
         """Check if a record matches a dimension filter."""
-        if dimension == "global":
-            return True
-        if dimension == "provider":
-            return bool(record.get("provider") == dimension_id)
-        if dimension == "model":
-            return bool(record.get("model") == dimension_id)
-        if dimension == "user":
-            return bool(record.get("user_id", "anonymous") == dimension_id)
-        if dimension == "project":
-            return bool(record.get("project_id", "default") == dimension_id)
-        if dimension == "conversation":
-            return bool(record.get("conversation_id") == dimension_id)
-        if dimension == "agent":
-            return bool(record.get("agent_id") == dimension_id)
-        if dimension == "tenant":
-            return bool(record.get("tenant_id") == dimension_id)
-        return False
+        return matches_scope(record, dimension, dimension_id)
 
     def _matches_budget_scope(self, record: dict[str, Any], budget: dict[str, Any]) -> bool:
         """Check if a record matches a budget's scope."""
-        scope = budget.get("scope", "global")
-        scope_id = budget.get("scope_id", "")
-
-        if scope == "global":
-            return True
-        if scope == "provider":
-            return bool(record.get("provider") == scope_id)
-        if scope == "model":
-            return bool(record.get("model") == scope_id)
-        if scope == "project":
-            return bool(record.get("project_id", "default") == scope_id)
-        if scope == "user":
-            return bool(record.get("user_id", "anonymous") == scope_id)
-        if scope == "tenant":
-            return bool(record.get("tenant_id") == scope_id)
-        if scope == "user_project":
-            parts = scope_id.split(":")
-            if len(parts) == 2:
-                return bool(record.get("user_id") == parts[0] and record.get("project_id") == parts[1])
-        return False
+        return matches_scope(record, budget.get("scope", "global"), budget.get("scope_id", ""))

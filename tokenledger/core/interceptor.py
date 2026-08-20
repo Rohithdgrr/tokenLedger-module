@@ -10,9 +10,11 @@ from typing import Any, Callable, Optional
 
 from .budget import BudgetEnforcer, BudgetExceededError
 from .estimator import TokenEstimator
+from .exceptions import CircuitBreakerOpenError, UnknownModelError
 from .extractor import TokenExtractor
 from .pricing import PricingRegistry
 from .record import build_record
+from .scopes import matches_scope
 from .store import StorageBackend
 from .verifier import VerificationEngine
 
@@ -34,9 +36,6 @@ def _is_transient(exc: BaseException) -> bool:
     if isinstance(exc, TRANSIENT_EXCEPTIONS):
         return True
     return getattr(exc, "status_code", None) in TRANSIENT_STATUS_CODES
-
-
-from .exceptions import CircuitBreakerOpenError, UnknownModelError
 
 
 class TokenBucket:
@@ -103,15 +102,20 @@ class StreamWrapper:
     still billable.
     """
 
-    def __init__(self, stream: Any, provider: str, on_finish: Optional[Callable] = None):
+    def __init__(self, stream: Any, provider: str, on_finish: Optional[Callable] = None, max_chunks: int = 2000):
         self._stream = stream
         self._provider = provider
         self._on_finish = on_finish
         self._chunks: list[Any] = []
         self._text_parts: list[str] = []
+        self._max_chunks = max_chunks
 
     def _capture(self, chunk: Any) -> None:
         self._chunks.append(chunk)
+        if len(self._chunks) > self._max_chunks:
+            # Bounded history — drop the oldest chunks but keep the tail,
+            # which is where provider usage metadata lives.
+            del self._chunks[: len(self._chunks) - self._max_chunks]
         delta = getattr(chunk, "delta", None)
         if delta is None:
             delta = getattr(chunk, "text", None)
@@ -128,20 +132,40 @@ class StreamWrapper:
             cb()
 
     def __iter__(self) -> Iterator[Any]:
+        exc: Optional[BaseException] = None
         try:
             for chunk in self._stream:
                 self._capture(chunk)
                 yield chunk
+        except BaseException as e:
+            exc = e
+            raise
         finally:
-            self._finalize()
+            try:
+                self._finalize()
+            except Exception as cb_err:
+                if exc is None:
+                    raise cb_err
+                # Preserve the stream's original exception; the finalizer
+                # error is secondary diagnostics.
+                logger.warning("Stream finalizer raised after stream error: %s", cb_err)
 
     async def __aiter__(self) -> AsyncIterator[Any]:
+        exc: Optional[BaseException] = None
         try:
             async for chunk in self._stream:
                 self._capture(chunk)
                 yield chunk
+        except BaseException as e:
+            exc = e
+            raise
         finally:
-            self._finalize()
+            try:
+                self._finalize()
+            except Exception as cb_err:
+                if exc is None:
+                    raise cb_err
+                logger.warning("Stream finalizer raised after stream error: %s", cb_err)
 
     def get_stream_text(self) -> str:
         return "".join(self._text_parts)
@@ -205,7 +229,10 @@ class _ProxyWrapper:
             setattr(object.__getattribute__(self, "_client"), name, value)
 
     def __repr__(self) -> str:
-        return f"<TokenLedgerProxy provider={object.__getattribute__(self, '_provider')} attr={object.__getattribute__(self, '_attr_path')} client={object.__getattribute__(self, '_client')!r}>"
+        client = object.__getattribute__(self, "_client")
+        provider = object.__getattribute__(self, "_provider")
+        attr = object.__getattribute__(self, "_attr_path")
+        return f"<TokenLedgerProxy provider={provider} attr={attr} client={client!r}>"
 
     def __dir__(self) -> list[str]:
         return dir(object.__getattribute__(self, "_client"))
@@ -252,7 +279,7 @@ class InterceptionLayer:
         self.on_record = on_record
         self.on_budget_threshold: Optional[Callable] = None
         self.ghost_mode = ghost_mode
-        self._original_methods: dict[int, dict[str, Callable]] = {}
+        self._original_methods: dict[int, dict[str, tuple[Any, str, Callable]]] = {}
         self._circuit_state: dict[str, dict] = {}
         self._rate_buckets: dict[str, TokenBucket] = {}
         self._provider_config: dict[str, dict[str, Any]] = {}
@@ -264,9 +291,13 @@ class InterceptionLayer:
     def _get_provider_config(self, provider: str) -> dict[str, Any]:
         return self._provider_config.get(provider, {})
 
-    def _strip_tracking_kwargs(self, kwargs: dict[str, Any]) -> None:
-        for key in TRACKING_KWARGS:
-            kwargs.pop(key, None)
+    def _strip_tracking_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Return a copy of *kwargs* with tracking fields removed.
+
+        Never mutates the caller's dict — callers may reuse the same
+        kwargs object for multiple API calls.
+        """
+        return {k: v for k, v in kwargs.items() if k not in TRACKING_KWARGS}
 
     def _make_tracked_fn(self, original: Callable, provider: str) -> Callable:
         if inspect.iscoroutinefunction(original):
@@ -282,16 +313,30 @@ class InterceptionLayer:
         return tracked_sync
 
     def _wrap_attr(self, client: Any, attr_path: str, provider: str) -> Any:
+        """Monkey-patch *client* so calls at ``attr_path`` are tracked.
+
+        Unwrap-safe: bound methods are stored as-is, but descriptors
+        (``property``/``classmethod``/``staticmethod``) are stored at the
+        class level so ``unwrap()`` restores the descriptor, not an
+        evaluated value.
+        """
         client_id = id(client)
-        if client_id not in self._original_methods:
-            self._original_methods[client_id] = {}
+        originals = self._original_methods.setdefault(client_id, {})
+        if attr_path in originals:
+            # Idempotent: re-wrapping would nest tracked fns (double
+            # recording) and clobber the saved original.
+            return client
         parts = attr_path.split(".")
         parent = client
         for part in parts[:-1]:
             parent = getattr(parent, part)
-        original = getattr(parent, parts[-1])
-        self._original_methods[client_id][attr_path] = original
-        setattr(parent, parts[-1], self._make_tracked_fn(original, provider))
+        attr_name = parts[-1]
+        original = getattr(parent, attr_name)
+        cls_attr = getattr(type(parent), attr_name, None)
+        if isinstance(cls_attr, (property, classmethod, staticmethod)):
+            original = cls_attr
+        originals[attr_path] = (parent, attr_name, original)
+        setattr(parent, attr_name, self._make_tracked_fn(getattr(parent, attr_name), provider))
         return client
 
     def wrap_proxy(self, client: Any, attr_path: str, provider: str) -> Any:
@@ -350,12 +395,8 @@ class InterceptionLayer:
     def unwrap(self, client: Any) -> Any:
         client_id = id(client)
         originals = self._original_methods.pop(client_id, {})
-        for attr_path, original in originals.items():
-            parts = attr_path.split(".")
-            parent = client
-            for part in parts[:-1]:
-                parent = getattr(parent, part)
-            setattr(parent, parts[-1], original)
+        for _attr_path, (parent, attr_name, original) in originals.items():
+            setattr(parent, attr_name, original)
         return client
 
     def get_health(self) -> dict[str, Any]:
@@ -420,7 +461,7 @@ class InterceptionLayer:
     def _call_with_retry(
         self, original: Callable, args: tuple, kwargs: dict[str, Any], provider: str, timeout: Optional[float] = None
     ) -> Any:
-        self._strip_tracking_kwargs(kwargs)
+        kwargs = self._strip_tracking_kwargs(kwargs)
         cfg = self._get_provider_config(provider)
         max_retries = cfg.get("max_retries", self.max_retries)
         retry_delay = cfg.get("retry_delay", self.retry_delay)
@@ -442,7 +483,8 @@ class InterceptionLayer:
     async def _call_with_retry_async(
         self, original: Callable, args: tuple, kwargs: dict[str, Any], provider: str, timeout: Optional[float] = None
     ) -> Any:
-        self._strip_tracking_kwargs(kwargs)
+        # Rebinding locally keeps the caller's dict untouched.
+        kwargs = self._strip_tracking_kwargs(kwargs)
         cfg = self._get_provider_config(provider)
         max_retries = cfg.get("max_retries", self.max_retries)
         retry_delay = cfg.get("retry_delay", self.retry_delay)
@@ -483,6 +525,9 @@ class InterceptionLayer:
                 model=metadata["model"],
                 messages=kwargs.get("messages", []),
                 max_tokens=kwargs.get("max_tokens"),
+                tenant_id=metadata.get("tenant_id") or "",
+                conversation_id=metadata.get("conversation_id") or "",
+                agent_id=metadata.get("agent_id") or "",
             )
         except BudgetExceededError as e:
             if self.ghost_mode:
@@ -516,9 +561,55 @@ class InterceptionLayer:
             if self.on_record:
                 self.on_record(record)
             return
-        self.store.insert_record(record)
+        try:
+            self.store.insert_record(record)
+        except Exception as e:
+            # Best-effort persistence — a store failure (disk full, DB
+            # locked) must never fail the user's API call.
+            logger.error("Failed to persist usage record: %s", e)
         if self.on_record:
             self.on_record(record)
+        # Post-hoc strict budget enforcement: actual cost may exceed the
+        # pre-flight estimate. Matches budgets for this record's scope only.
+        if getattr(self.ledger, "strict_budget", False) and record.get("status") not in ("blocked", "error"):
+            self._enforce_post_hoc_budget(record)
+        # Cost contracts — enforce after every stored record (scoped or global)
+        try:
+            ledger_contracts = getattr(self.ledger, "cost_contracts", None)
+            if ledger_contracts:
+                for contract in ledger_contracts.all():
+                    if not ledger_contracts.check(contract.name, float(record.get("cost_usd", 0) or 0)):
+                        record["contract_breached"] = contract.name
+                        break
+        except Exception:
+            pass
+
+    def _enforce_post_hoc_budget(self, record: dict[str, Any]) -> None:
+        """Raise after insertion when a post-hoc overrun exceeds the grace margin."""
+        try:
+            for _key, b in self.store.get_all_budgets().items():
+                if not matches_scope(record, b.get("scope", "global"), b.get("scope_id", "all")):
+                    continue
+                spend = self.enforcer._calculate_current_spend(b)
+                limit = float(b.get("limit_usd", 0))
+                if limit and spend > limit * 1.05:
+                    record["budget_overrun"] = True
+                    err = BudgetExceededError(
+                        f"Post-hoc budget overrun: ${spend:.4f} > ${limit:.4f}",
+                        b.get("scope", ""),
+                        b.get("scope_id", ""),
+                        spend,
+                        limit,
+                    )
+                    if self.on_budget_exceeded:
+                        self.on_budget_exceeded(err)
+                    # Ghost mode records the flag but never blocks the call.
+                    if not record.get("_ghost"):
+                        raise err
+        except BudgetExceededError:
+            raise
+        except Exception:
+            pass
 
     def _record(self, provider: str, metadata: dict[str, Any], messages: list, response: Any, latency_ms: float) -> None:
         self._apply_prompt_redaction(metadata, messages)
@@ -544,6 +635,9 @@ class InterceptionLayer:
             conversation_id=metadata.get("conversation_id"),
             agent_id=metadata.get("agent_id"),
             prompt_hash=metadata.get("prompt_hash"),
+            cached_input_tokens=int(token_data.get("cached_input_tokens", 0) or 0),
+            cache_hit=bool(token_data.get("cache_hit") or token_data.get("cached_input_tokens")),
+            reasoning_tokens=int(token_data.get("reasoning_tokens", 0) or 0),
         )
         self._finalize_and_store(provider, metadata, record, response)
         self.enforcer.update_model_stats(metadata["model"], token_data["input_tokens"], token_data["output_tokens"])
@@ -658,4 +752,7 @@ class InterceptionLayer:
             status="blocked",
             tenant_id=metadata.get("tenant_id"),
         )
-        self.store.insert_record(record)
+        try:
+            self.store.insert_record(record)
+        except Exception as e:
+            logger.warning("Failed to persist blocked-attempt record: %s", e)

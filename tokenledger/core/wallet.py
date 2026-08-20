@@ -10,9 +10,10 @@ one-shot ``on_low_balance`` callback when the balance drops below a
 fraction of the original limit.
 """
 
+import threading
 from typing import Any, Callable, Optional
 
-from .exceptions import BudgetExceededError, WalletExhaustedError
+from .exceptions import WalletExhaustedError
 from .ledger import TokenLedger
 
 # Re-export for backwards compatibility
@@ -41,6 +42,7 @@ class Wallet:
         self.low_balance_threshold = low_balance_threshold
         self.on_low_balance = on_low_balance
         self._low_alerted = False
+        self._reservation_lock = threading.Lock()
         self.ledger.set_budget("user", user_id, limit_usd, reset_cycle)
 
     @property
@@ -91,23 +93,31 @@ class Wallet:
         spend past the limit; returns ``True`` otherwise. Fires the
         one-shot ``on_low_balance`` callback the first time the balance
         drops below ``low_balance_threshold * limit``.
+
+        .. note::
+            The check-and-compare step is serialized with a per-wallet lock
+            so concurrent ``debit`` calls cannot both pass an exhausted
+            balance. Expected (not reserved) amounts — actual spend is
+            settled from verified ledger records, and post-hoc budget
+            enforcement still applies on top of the wallet.
         """
         budget = self._budget()
-        spend = self.spend()
-        est = self._estimate(provider, model, messages, input_tokens, output_tokens, max_tokens)
-        limit = float(budget.get("limit_usd", 0.0))
-        if est > limit - spend:
-            raise WalletExhaustedError(
-                message=(
-                    f"Wallet exhausted for {self.user_id}: "
-                    f"${spend:.4f} + ${est:.4f} > ${limit:.4f}"
-                ),
-                scope="user",
-                scope_id=self.user_id,
-                current_spend=spend,
-                limit=limit,
-            )
-        remaining = limit - spend - est
+        with self._reservation_lock:
+            spend = self.spend()
+            est = self._estimate(provider, model, messages, input_tokens, output_tokens, max_tokens)
+            limit = float(budget.get("limit_usd", 0.0))
+            if est > limit - spend:
+                raise WalletExhaustedError(
+                    message=(
+                        f"Wallet exhausted for {self.user_id}: "
+                        f"${spend:.4f} + ${est:.4f} > ${limit:.4f}"
+                    ),
+                    scope="user",
+                    scope_id=self.user_id,
+                    current_spend=spend,
+                    limit=limit,
+                )
+            remaining = limit - spend - est
         if not self._low_alerted and remaining < self.low_balance_threshold * limit:
             self._low_alerted = True
             if self.on_low_balance:

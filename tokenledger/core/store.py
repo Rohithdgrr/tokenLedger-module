@@ -64,6 +64,19 @@ class StorageBackend(abc.ABC):
         """Prune records outside the retention window. Backends may override."""
         self.compact(max_age_days=max_age_days)
 
+    def list_running_totals(self, prefix: str = "") -> list[tuple[str, dict[str, Any]]]:
+        """Return ``(key, totals)`` pairs whose key starts with *prefix*.
+
+        Keeps analytics decoupled from the ABC — custom backends that do not
+        maintain an in-memory ``running_totals`` dict can override this.
+        """
+        totals = getattr(self, "running_totals", {})
+        return [(k, v) for k, v in totals.items() if k.startswith(prefix)]
+
+    def delete_budget(self, scope: str, scope_id: str) -> None:
+        """Remove a budget rule. Persisted backends should override to delete rows."""
+        self.budgets.pop(f"{scope}:{scope_id}", None)
+
 
 def _is_billable(record: dict[str, Any]) -> bool:
     """Ghost-mode and blocked/error records must not count toward spend."""
@@ -72,7 +85,7 @@ def _is_billable(record: dict[str, Any]) -> bool:
     return record.get("status") not in ("blocked", "error")
 
 
-_RETENTION_CHECK_INTERVAL_S = 60.0
+_RETENTION_CHECK_INTERVAL_S = 3600.0  # Throttle full rebuilds to hourly; deque maxlen handles count cap O(1)
 
 
 class RetentionPolicy:
@@ -93,6 +106,40 @@ def _checksum_sorted(record: dict[str, Any]) -> str:
     """Legacy sort-keys checksum used by files written before v1.5.1."""
     raw = json.dumps(record, sort_keys=True, default=str).encode()
     return hashlib.sha256(raw).hexdigest()
+
+
+def checksum_matches(record: dict[str, Any]) -> bool:
+    """Accept both unordered (current) and sorted (pre-v1.5.1) checksums.
+
+    Both backends use this so migrated records never produce false
+    tamper positives from serialization-order differences.
+    """
+    expected = record.get("_checksum")
+    if not expected:
+        return True
+    body = {k: v for k, v in record.items() if k != "_checksum"}
+    if _checksum(body) == expected:
+        return True
+    return bool(_checksum_sorted(body) == expected)
+
+
+def normalize_ts(value: Any) -> str:
+    """Normalize an ISO timestamp to naive UTC for safe lexicographic comparison.
+
+    Records are stored UTC without an offset so string comparisons in
+    ``compact``/``get_windowed_spend`` are order-correct. Unparseable values
+    are returned unchanged so callers can fall back to other handling.
+    """
+    if not isinstance(value, str) or not value:
+        return "" if value is None else str(value)
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return value
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
+        return dt.replace(tzinfo=None).isoformat()
+    return value
 
 
 _MAGIC = b"TLDGR1\0"
@@ -170,7 +217,13 @@ def _decrypt(raw: bytes, key: bytes) -> Optional[bytes]:
 
 
 class MemoryStore(StorageBackend):
-    """Thread-safe in-memory store with ring buffer, retention, keyed obfuscation, and JSONL persistence."""
+    """Thread-safe in-memory store with ring buffer, retention, keyed obfuscation, and JSONL persistence.
+
+    .. note::
+        ``records`` is a length-capped deque. Retention may replace the
+        deque object, so external code should never cache a reference to
+        ``store.records`` — always go through :meth:`get_records`.
+    """
 
     def __init__(
         self,
@@ -352,38 +405,22 @@ class MemoryStore(StorageBackend):
 
     def get_windowed_spend(self, budget: dict[str, Any], window_start: str) -> Optional[float]:
         """MemoryStore windowed spend — filtered scan with window_start."""
-        # Check for cached window? For now simple filtered scan but respects window.
         # This is still O(n) but avoids full history scan when window is recent.
         # For large histories, callers will hit this only for windowed budgets.
+        from .scopes import matches_scope
+
+        ws = normalize_ts(window_start)
+        scope = budget.get("scope", "global")
+        scope_id = budget.get("scope_id", "")
         total = 0.0
-        # Use local copy to avoid holding lock during iteration? Keep lock for thread safety.
         with self.lock:
             for r in self.records:
                 ts = r.get("timestamp", "")
-                if ts and ts < window_start:
+                if ts and normalize_ts(ts) < ws:
                     continue
                 if r.get("status") in ("blocked", "error") or r.get("_ghost"):
                     continue
-                # Scope check delegated to BudgetEnforcer? Duplicate logic here for speed.
-                scope = budget.get("scope", "global")
-                scope_id = budget.get("scope_id", "")
-                if scope == "global":
-                    pass
-                elif scope == "project" and r.get("project_id", "default") != scope_id:
-                    continue
-                elif scope == "user" and r.get("user_id", "anonymous") != scope_id:
-                    continue
-                elif scope == "user_project":
-                    parts = scope_id.split(":")
-                    if len(parts) != 2 or r.get("user_id") != parts[0] or r.get("project_id") != parts[1]:
-                        continue
-                elif scope == "provider" and r.get("provider") != scope_id:
-                    continue
-                elif scope == "model" and r.get("model") != scope_id:
-                    continue
-                elif scope == "tenant" and r.get("tenant_id") != scope_id:
-                    continue
-                elif scope not in ("global", "project", "user", "user_project", "provider", "model", "tenant"):
+                if not matches_scope(r, scope, scope_id):
                     continue
                 total += float(r.get("cost_usd", 0) or 0)
         return total
@@ -417,12 +454,28 @@ class MemoryStore(StorageBackend):
             if parsed is None or parsed >= cutoff:
                 pruned.append(r)
         if len(pruned) < len(self.records):
+            # Rebuilding from remaining rows would silently reset "never"
+            # budgets whose spend came from pruned records — preserve them.
+            saved_never_totals = self._collect_never_totals()
             self.records = deque(pruned, maxlen=self.retention.max_records)
             self.running_totals.clear()
             for r in self.records:
                 self._update_running_totals(r)
+            self._restore_never_totals(saved_never_totals)
             if self.persist_path and self.retention.archive_on_trim:
                 self._rewrite_disk()
+
+    def _collect_never_totals(self) -> dict[str, dict[str, Any]]:
+        """Snapshot running totals for budgets that must never reset."""
+        return {
+            key: dict(self.running_totals.get(key, {}))
+            for key, b in self.budgets.items()
+            if b.get("reset_cycle") == "never"
+        }
+
+    def _restore_never_totals(self, saved: dict[str, dict[str, Any]]) -> None:
+        for key, totals in saved.items():
+            self.running_totals.setdefault(key, {}).update(totals)
 
     def _rewrite_disk(self) -> None:
         """Rewrite the on-disk JSONL to match current in-memory records (used after retention trim)."""
@@ -477,13 +530,9 @@ class MemoryStore(StorageBackend):
         """
         tampered = []
         for r in self.get_records():
-            expected = r.get("_checksum", "")
-            if not expected:
+            if not r.get("_checksum"):
                 continue
-            actual = _checksum({k: v for k, v in r.items() if k != "_checksum"})
-            if actual != expected:
-                actual = _checksum_sorted({k: v for k, v in r.items() if k != "_checksum"})
-            if expected != actual:
+            if not checksum_matches(r):
                 tampered.append(r.get("record_id", "unknown"))
         return tampered
 
