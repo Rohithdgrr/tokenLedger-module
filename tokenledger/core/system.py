@@ -9,7 +9,7 @@ def _cpu() -> dict[str, Any]:
     try:
         import psutil
         return {
-            "percent": psutil.cpu_percent(interval=0.1),
+            "percent": psutil.cpu_percent(interval=None),
             "count": psutil.cpu_count(),
             "freq": getattr(psutil.cpu_freq(), "current", 0) if psutil.cpu_freq() else 0,
         }
@@ -59,17 +59,28 @@ def _network() -> dict[str, Any]:
 
 
 def _internet(timeout: float = 2.0) -> dict[str, Any]:
+    import time as _time
+
     hosts = ["8.8.8.8", "1.1.1.1", "208.67.222.222"]
     for host in hosts:
+        s = None
         try:
             import socket
+
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(timeout)
+            start = _time.monotonic()
             s.connect((host, 53))
-            s.close()
-            return {"reachable": True, "latency_ms": 0.0, "host": host}
+            latency = round((_time.monotonic() - start) * 1000, 2)
+            return {"reachable": True, "latency_ms": latency, "host": host}
         except (socket.timeout, OSError):
             continue
+        finally:
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
     return {"reachable": False, "latency_ms": 0.0, "host": ""}
 
 
@@ -181,6 +192,8 @@ class SystemMonitor:
             if context:
                 record.update(context)
             self.metrics.append(record)
+            if len(self.metrics) > 10_000:
+                self.metrics = self.metrics[-10_000:]
             return record
 
     def get_metrics(self, start: Optional[str] = None, end: Optional[str] = None) -> list[dict[str, Any]]:

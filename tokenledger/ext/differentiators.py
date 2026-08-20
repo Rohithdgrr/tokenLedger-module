@@ -78,12 +78,12 @@ class PromptCache:
         return self._cache.get(key)
 
     def find_similar(self, content: str, threshold: float | None = None) -> list[tuple[str, float]]:
-        t = threshold or self._threshold
-        results = [
-            (k, round(difflib.SequenceMatcher(None, content, v).ratio(), 4))
-            for k, v in self._cache.items()
-            if difflib.SequenceMatcher(None, content, v).ratio() >= t
-        ]
+        t = threshold if threshold is not None else self._threshold
+        results: list[tuple[str, float]] = []
+        for k, v in self._cache.items():
+            ratio = difflib.SequenceMatcher(None, content, v).ratio()
+            if ratio >= t:
+                results.append((k, round(ratio, 4)))
         return sorted(results, key=lambda x: -x[1])
 
 

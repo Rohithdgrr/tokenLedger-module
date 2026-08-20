@@ -35,10 +35,11 @@ class _ThreadingHTTPServer(ThreadingHTTPServer):
 class LiveServer:
     """A tiny daemon HTTP server streaming ledger activity."""
 
-    def __init__(self, ledger: TokenLedger, host: str = "127.0.0.1", port: int = 8765):
+    def __init__(self, ledger: TokenLedger, host: str = "127.0.0.1", port: int = 8765, api_key: Optional[str] = None):
         self.ledger = ledger
         self.host = host
         self.port = port
+        self.api_key = api_key
         self._subscribers: list[queue.Queue] = []
         self._lock = threading.Lock()
         self._httpd: Optional[_ThreadingHTTPServer] = None
@@ -142,6 +143,13 @@ def _make_handler(server: LiveServer) -> type:
             self.end_headers()
 
         def do_GET(self) -> None:
+            if self._server.api_key:
+                auth = self.headers.get("Authorization", "")
+                if not auth.startswith("Bearer ") or auth[7:] != self._server.api_key:
+                    self.send_response(401)
+                    self.end_headers()
+                    self.wfile.write(b'{"error": "unauthorized"}')
+                    return
             path = self.path.split("?", 1)[0]
             try:
                 if path == "/stats":

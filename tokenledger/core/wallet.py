@@ -12,12 +12,11 @@ fraction of the original limit.
 
 from typing import Any, Callable, Optional
 
-from .budget import BudgetExceededError
+from .exceptions import BudgetExceededError, WalletExhaustedError
 from .ledger import TokenLedger
 
-
-class WalletExhaustedError(BudgetExceededError):
-    """Raised when a wallet debit would exceed the remaining allowance."""
+# Re-export for backwards compatibility
+__all__ = ["WalletExhaustedError"]
 
 
 class Wallet:

@@ -37,6 +37,11 @@ class NegativeTokenRule(VerificationRule):
 
 class CostRecalculationRule(VerificationRule):
     def check(self, record: dict[str, Any], store: StorageBackend, pricing: PricingRegistry) -> Optional[str]:
+        # Respect explicit allow-zero-cost flag (unknown_model_policy="allow")
+        if record.get("_allow_zero_cost"):
+            if record.get("cost_usd", 0) != 0.0:
+                record["cost_usd"] = 0.0
+            return None
         expected = pricing.calculate_cost(
             record.get("provider", "unknown"), record.get("model", "unknown"),
             record.get("input_tokens", 0), record.get("output_tokens", 0),

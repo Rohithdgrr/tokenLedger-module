@@ -2,6 +2,8 @@
 
 import json
 import logging
+import threading
+import time
 from typing import Any, Optional
 from urllib.error import URLError
 from urllib.parse import urlparse
@@ -31,10 +33,20 @@ class WebhookNotifier:
         slack_url: Optional[str] = None,
         generic_url: Optional[str] = None,
         timeout: float = 5.0,
+        batch_size: int = 10,
+        flush_interval: float = 5.0,
+        throttle_interval: float = 0.0,
     ):
         self.slack_url = slack_url
         self.generic_url = generic_url
         self.timeout = timeout
+        self.batch_size = batch_size
+        self.flush_interval = flush_interval
+        self.throttle_interval = throttle_interval
+        self._batch: list[dict[str, Any]] = []
+        self._batch_lock = threading.Lock()
+        self._batch_timer: Optional[threading.Timer] = None
+        self._last_send = 0.0
         if slack_url:
             _validate_http_url(slack_url, "slack_url")
         if generic_url:
@@ -73,15 +85,69 @@ class WebhookNotifier:
         logger.warning(msg)
         self._post({"event": "budget_exceeded", "message": str(error)})
 
+    def _flush_batch(self) -> None:
+        with self._batch_lock:
+            batch, self._batch = self._batch, []
+            if self._batch_timer:
+                self._batch_timer.cancel()
+                self._batch_timer = None
+        if not batch:
+            return
+        # Throttle: skip if called too recently
+        if self.throttle_interval and (time.monotonic() - self._last_send) < self.throttle_interval:
+            return
+        self._last_send = time.monotonic()
+        if len(batch) == 1:
+            r = batch[0]
+            self._post({
+                "event": "record",
+                "message": f"[TokenLedger] {r.get('model','?')} — "
+                f"${r.get('cost_usd',0):.6f}, {r.get('total_tokens',0)} tokens",
+                "record": r,
+            })
+        else:
+            self._post({"event": "batch", "count": len(batch), "records": batch})
+
     def on_record(self, record: dict[str, Any]) -> None:
         cost = record.get("cost_usd", 0)
-        if cost > 0:
+        if cost == 0:
+            return
+        # Batch to avoid flooding at high throughput
+        if self.batch_size <= 1:
             self._post({
                 "event": "record",
                 "message": f"[TokenLedger] {record.get('model','?')} — "
                 f"${cost:.6f}, {record.get('total_tokens',0)} tokens",
                 "record": record,
             })
+            return
+        with self._batch_lock:
+            self._batch.append(record)
+            if len(self._batch) >= self.batch_size:
+                # flush synchronously without holding lock
+                batch = list(self._batch)
+                self._batch.clear()
+                if self._batch_timer:
+                    self._batch_timer.cancel()
+                    self._batch_timer = None
+            else:
+                if self._batch_timer is None:
+                    self._batch_timer = threading.Timer(self.flush_interval, self._flush_batch)
+                    self._batch_timer.daemon = True
+                    self._batch_timer.start()
+                return
+        # Flush outside lock for the batch_size-triggered case
+        if 'batch' in locals():
+            if len(batch) == 1:
+                r = batch[0]
+                self._post({
+                    "event": "record",
+                    "message": f"[TokenLedger] {r.get('model','?')} — "
+                    f"${r.get('cost_usd',0):.6f}, {r.get('total_tokens',0)} tokens",
+                    "record": r,
+                })
+            else:
+                self._post({"event": "batch", "count": len(batch), "records": batch})
 
     def on_budget_threshold(
         self, scope: str, scope_id: str, current_spend: float, limit: float

@@ -52,6 +52,14 @@ class StorageBackend(abc.ABC):
     @abc.abstractmethod
     def verify_immutability(self) -> list[str]: ...
 
+    def get_windowed_spend(self, budget: dict[str, Any], window_start: str) -> Optional[float]:
+        """Efficient windowed spend query. Return None to fall back to full scan.
+
+        Backends that can push filtering into storage (e.g. SQLite) should
+        override this to avoid O(n) scans.
+        """
+        return None
+
     def apply_retention(self, max_age_days: Optional[int] = None) -> None:
         """Prune records outside the retention window. Backends may override."""
         self.compact(max_age_days=max_age_days)
@@ -229,22 +237,33 @@ class MemoryStore(StorageBackend):
         return bytes(out)
 
     def _append_to_disk(self) -> None:
-        """Rewrite the JSONL file from in-memory records.
+        """Persist records to disk.
 
-        Unencrypted files are written line-by-line with a per-line checksum;
-        keyed files are written as a single authenticated blob so no plaintext
-        boundary is exposed and wrong keys are detected on load.
+        Encrypted files are written as a single authenticated blob so no
+        plaintext boundary is exposed and wrong keys are detected on load.
+        Plaintext files use a true append-only write for O(1) I/O per insert.
         """
+        if self.persist_path is None:
+            return
         try:
-            payload = self._serialize_lines()
             if self.encryption_key:
+                payload = self._serialize_lines()
                 payload = _encrypt(payload, self.encryption_key)
-            if self.persist_path is None:
-                return
-            with open(self.persist_path, "wb") as f:
-                f.write(payload)
-                f.flush()
-                os.fsync(f.fileno())
+                with open(self.persist_path, "wb") as f:
+                    f.write(payload)
+                    f.flush()
+                    os.fsync(f.fileno())
+            else:
+                # Append only the newest record — O(1) instead of rewriting N records
+                record = self.records[-1] if self.records else None
+                if record is None:
+                    return
+                line = json.dumps(record, default=str)
+                checksum = hashlib.sha256(line.encode()).hexdigest()
+                with open(self.persist_path, "ab") as f:
+                    f.write(f"{checksum}:{line}\n".encode())
+                    f.flush()
+                    os.fsync(f.fileno())
         except OSError as e:
             logger.warning("Failed to persist record: %s", e)
 
@@ -321,6 +340,53 @@ class MemoryStore(StorageBackend):
             self.records.clear()
             self.running_totals.clear()
             self.budgets.clear()
+            if self.persist_path:
+                try:
+                    # Truncate persist file so records don't resurrect on restart
+                    open(self.persist_path, "wb").close()
+                    bak = self.persist_path + ".bak"
+                    if os.path.exists(bak):
+                        os.remove(bak)
+                except OSError:
+                    pass
+
+    def get_windowed_spend(self, budget: dict[str, Any], window_start: str) -> Optional[float]:
+        """MemoryStore windowed spend — filtered scan with window_start."""
+        # Check for cached window? For now simple filtered scan but respects window.
+        # This is still O(n) but avoids full history scan when window is recent.
+        # For large histories, callers will hit this only for windowed budgets.
+        total = 0.0
+        # Use local copy to avoid holding lock during iteration? Keep lock for thread safety.
+        with self.lock:
+            for r in self.records:
+                ts = r.get("timestamp", "")
+                if ts and ts < window_start:
+                    continue
+                if r.get("status") in ("blocked", "error") or r.get("_ghost"):
+                    continue
+                # Scope check delegated to BudgetEnforcer? Duplicate logic here for speed.
+                scope = budget.get("scope", "global")
+                scope_id = budget.get("scope_id", "")
+                if scope == "global":
+                    pass
+                elif scope == "project" and r.get("project_id", "default") != scope_id:
+                    continue
+                elif scope == "user" and r.get("user_id", "anonymous") != scope_id:
+                    continue
+                elif scope == "user_project":
+                    parts = scope_id.split(":")
+                    if len(parts) != 2 or r.get("user_id") != parts[0] or r.get("project_id") != parts[1]:
+                        continue
+                elif scope == "provider" and r.get("provider") != scope_id:
+                    continue
+                elif scope == "model" and r.get("model") != scope_id:
+                    continue
+                elif scope == "tenant" and r.get("tenant_id") != scope_id:
+                    continue
+                elif scope not in ("global", "project", "user", "user_project", "provider", "model", "tenant"):
+                    continue
+                total += float(r.get("cost_usd", 0) or 0)
+        return total
 
     def _apply_retention(self, force: bool = False) -> None:
         """Prune records older than ``max_age_days`` (amortized).
@@ -366,7 +432,13 @@ class MemoryStore(StorageBackend):
             if os.path.exists(self.persist_path):
                 backup = self.persist_path + ".bak"
                 os.replace(self.persist_path, backup)
-            self._append_to_disk()
+            payload = self._serialize_lines()
+            if self.encryption_key:
+                payload = _encrypt(payload, self.encryption_key)
+            with open(self.persist_path, "wb") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
         except OSError as e:
             logger.warning("Failed to rewrite disk after retention: %s", e)
 
@@ -385,11 +457,24 @@ class MemoryStore(StorageBackend):
                 self.retention.max_age_days = max_age_days
             self._apply_retention(force=True)
 
+    def close(self) -> None:
+        """No-op for symmetry with SqliteStore; enables polymorphic cleanup."""
+
     def get_record_count(self) -> int:
         with self.lock:
             return len(self.records)
 
     def verify_immutability(self) -> list[str]:
+        """
+        Check per-record SHA-256 checksums for tampering.
+
+        .. note::
+            This is **tamper-evident, not tamper-proof**. The checksum is stored
+            alongside the record, so an attacker with write access can modify the
+            record and recompute the checksum. For strong guarantees, use
+            :meth:`tokenledger.TokenLedger.sign_ledger` with an external HMAC key
+            kept outside the store, or export a signed audit bundle.
+        """
         tampered = []
         for r in self.get_records():
             expected = r.get("_checksum", "")

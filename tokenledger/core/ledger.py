@@ -101,14 +101,24 @@ class _UsageContext:
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Literal[False]:
-        self._record("error" if exc_type else "success")
+        try:
+            self._record("error" if exc_type else "success")
+        except Exception as e:
+            import logging
+
+            logging.getLogger(__name__).warning("Failed to record usage block: %s", e)
         return False
 
     async def __aenter__(self) -> _UsageContext:
         return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> Literal[False]:
-        self._record("error" if exc_type else "success")
+        try:
+            self._record("error" if exc_type else "success")
+        except Exception as e:
+            import logging
+
+            logging.getLogger(__name__).warning("Failed to record usage block: %s", e)
         return False
 
 
@@ -127,6 +137,8 @@ class TokenLedger:
         differential_privacy_epsilon: float | None = None,
         redact_prompts: bool = False,
         ghost_mode: bool = False,
+        strict_budget: bool = False,
+        ghost_persist: bool = True,
     ):
         self.store = store or MemoryStore(
             persist_path=persist_path,
@@ -146,6 +158,8 @@ class TokenLedger:
         self.redact_prompts = redact_prompts
         self.ghost_mode = ghost_mode
         self.unknown_model_policy = unknown_model_policy
+        self.strict_budget = strict_budget
+        self.ghost_persist = ghost_persist
         self.interceptor = InterceptionLayer(
             ledger=self,
             store=self.store,
@@ -164,6 +178,10 @@ class TokenLedger:
         self.prompt_evolution = PromptEvolutionTracker()
         self.local_models = LocalModelRegistry()
 
+    def wrap_proxy(self, client: Any, attr_path: str, provider: str) -> Any:
+        """Non-mutating proxy wrapper — does not monkey-patch *client*."""
+        return self.interceptor.wrap_proxy(client, attr_path, provider)
+
     def wrap_openai(self, client: Any) -> Any:
         return self.interceptor.wrap_openai(client)
 
@@ -180,7 +198,7 @@ class TokenLedger:
         return self.interceptor.wrap_ollama(client)
 
     def wrap_openrouter(self, client: Any) -> Any:
-        return self.interceptor.wrap_openai(client)
+        return self.interceptor.wrap_openai(client, provider="openrouter")
 
     def wrap_deepseek(self, client: Any) -> Any:
         return self.interceptor.wrap_openai(client, provider="deepseek")
@@ -208,6 +226,14 @@ class TokenLedger:
 
     def wrap_perplexity(self, client: Any) -> Any:
         return self.interceptor.wrap_openai(client, provider="perplexity")
+
+    def register_parser(self, provider: str, parser: Callable[[Any], dict[str, Any] | None]) -> None:
+        """Register a custom token-extraction parser for a provider."""
+        self.extractor.register_parser(provider, parser)
+
+    def register_pricing_provider(self, provider: str, model: str, input_cost_per_1k: float, output_cost_per_1k: float) -> None:
+        """Alias for :meth:`register_pricing` to support plugin ergonomics."""
+        self.register_pricing(provider, model, input_cost_per_1k, output_cost_per_1k)
 
     def track(
         self,
@@ -303,8 +329,12 @@ class TokenLedger:
         if system_context and not self.system_monitor:
             raise ValueError("system_context=True requires a SystemMonitor instance")
 
+        # Redact prompt_hash when requested, but avoid double-hashing an
+        # already-hashed value (fingerprint is 64 hex chars).
         if self.redact_prompts and prompt_hash:
-            prompt_hash = hashlib.sha256(prompt_hash.encode()).hexdigest()
+            is_hex_hash = len(prompt_hash) == 64 and all(c in "0123456789abcdefABCDEF" for c in prompt_hash)
+            if not is_hex_hash:
+                prompt_hash = hashlib.sha256(prompt_hash.encode()).hexdigest()
 
         record = build_record(
             provider=provider,
@@ -334,6 +364,7 @@ class TokenLedger:
                 raise UnknownModelError(f"Unknown model: {provider}:{model}")
             if self.unknown_model_policy == "allow":
                 record["cost_usd"] = 0.0
+                record["_allow_zero_cost"] = True
 
         try:
             self.budget_enforcer.check_budget(
@@ -351,15 +382,39 @@ class TokenLedger:
                 raise
 
         if system_context:
-            if self.system_monitor is None:
-                raise ValueError("system_context=True requires a SystemMonitor instance")
-            record["system"] = self.system_monitor.snapshot()
+            record["system"] = self.system_monitor.snapshot()  # type: ignore[union-attr]
 
         verified = self.verifier.verify(record)
+
+        # Ghost-mode storage optimization: optionally drop ghost records
+        if verified.get("_ghost") and not getattr(self, "ghost_persist", True):
+            if self.interceptor.on_record:
+                self.interceptor.on_record(verified)
+            return verified
 
         self.store.insert_record(verified)
         if self.interceptor.on_record:
             self.interceptor.on_record(verified)
+        # Post-hoc strict budget enforcement: actual cost may exceed estimate
+        if self.strict_budget and not verified.get("_ghost") and verified.get("status") not in ("blocked", "error"):
+            try:
+                # Re-check with actual tokens; budget_enforcer will raise if over
+                # We use a small grace threshold (e.g., 5%) to avoid flapping
+                for _key, b in self.store.get_all_budgets().items():
+                    spend = self.budget_enforcer._calculate_current_spend(b)  # after insert, includes this record
+                    limit = float(b.get("limit_usd", 0))
+                    if limit and spend > limit * 1.05:
+                        verified["budget_overrun"] = True
+                        if self.interceptor.on_budget_exceeded:
+                            # Synthesize an error for callback compatibility
+                            from .exceptions import BudgetExceededError as _BEE
+
+                            self.interceptor.on_budget_exceeded(
+                                _BEE(f"Post-hoc budget overrun: ${spend:.4f} > ${limit:.4f}", b.get("scope",""), b.get("scope_id",""), spend, limit)
+                            )
+                        break
+            except Exception:
+                pass
         return verified
 
     def _add_noise(self, record: dict[str, Any]) -> dict[str, Any]:
@@ -449,17 +504,20 @@ class TokenLedger:
             on_low_balance=on_low_balance,
         )
 
-    def serve(self, host: str = "127.0.0.1", port: int = 8765) -> LiveServer:
+    def serve(self, host: str = "127.0.0.1", port: int = 8765, api_key: str | None = None) -> LiveServer:
         """Start a live spend server (``/stats`` JSON + ``/stream`` SSE)."""
         from ..ext.live_server import LiveServer
 
-        return LiveServer(self, host=host, port=port)
+        return LiveServer(self, host=host, port=port, api_key=api_key)
 
     def set_budget(self, scope: str, scope_id: str, limit_usd: float, reset_cycle: str = "monthly") -> None:
+        if limit_usd < 0:
+            raise ValueError("limit_usd must be non-negative")
         self.store.set_budget(scope, scope_id, {"scope": scope, "scope_id": scope_id, "limit_usd": limit_usd, "reset_cycle": reset_cycle})
 
-    def get_summary(self, scope: str = "global", scope_id: str = "all") -> dict[str, Any]:
-        return self.analytics.get_summary(scope, scope_id)
+    def get_summary(self, scope: str = "global", scope_id: str = "all", apply_dp: bool = False) -> dict[str, Any]:
+        eps = self.differential_privacy_epsilon if apply_dp else None
+        return self.analytics.get_summary(scope, scope_id, apply_dp=apply_dp, epsilon=eps)
 
     def get_spending_by_provider(self) -> list[dict[str, Any]]:
         return self.analytics.get_spending_by_dimension("provider")
@@ -479,19 +537,11 @@ class TokenLedger:
         Returns the audit bundle; writes it to ``filepath`` when provided.
         ``apply_dp`` applies differential privacy noise to exported copies
         when epsilon is configured.
+
+        Delegates to :class:`ExportEngine` to avoid duplication.
         """
         records = self.get_records(apply_dp=apply_dp)
-        audit = {
-            "exported_at": datetime.now(timezone.utc).isoformat(),
-            "record_count": len(records),
-            "verified": self.verify_immutability(),
-            "records": records,
-        }
-        audit["_checksum"] = hashlib.sha256(json.dumps(audit, sort_keys=True, default=str).encode()).hexdigest()
-        if filepath:
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(audit, f, indent=2, default=str)
-        return audit
+        return self.exporter.export_audit_json(filepath, records, verified=self.verify_immutability())
 
     def register_pricing(self, provider: str, model: str, input_cost_per_1k: float, output_cost_per_1k: float) -> None:
         self.pricing.register_custom(provider, model, input_cost_per_1k, output_cost_per_1k)

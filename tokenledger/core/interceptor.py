@@ -36,8 +36,7 @@ def _is_transient(exc: BaseException) -> bool:
     return getattr(exc, "status_code", None) in TRANSIENT_STATUS_CODES
 
 
-class CircuitBreakerOpenError(Exception):
-    """Raised when circuit breaker is open for a provider."""
+from .exceptions import CircuitBreakerOpenError, UnknownModelError
 
 
 class TokenBucket:
@@ -48,6 +47,7 @@ class TokenBucket:
         self.tokens = rate
         self.last = time.monotonic()
         self.lock = threading.RLock()
+        self._async_lock = asyncio.Lock()
 
     def _refill(self) -> None:
         now = time.monotonic()
@@ -69,15 +69,16 @@ class TokenBucket:
             time.sleep(sleep)
 
     async def async_consume(self) -> None:
-        with self.lock:
-            self._refill()
-            if self.tokens < 1:
-                sleep = (1 - self.tokens) / self.rate
-                self.tokens = 0
-                self.last = time.monotonic()
-            else:
-                sleep = 0.0
-                self.tokens -= 1
+        async with self._async_lock:
+            with self.lock:
+                self._refill()
+                if self.tokens < 1:
+                    sleep = (1 - self.tokens) / self.rate
+                    self.tokens = 0
+                    self.last = time.monotonic()
+                else:
+                    sleep = 0.0
+                    self.tokens -= 1
         if sleep:
             await asyncio.sleep(sleep)
 
@@ -95,6 +96,11 @@ class StreamWrapper:
     ``__iter__``/``__aiter__`` capture each chunk and run ``on_finish`` once
     the stream is exhausted, so usage is recorded even when the provider
     never emitted a final ``usage`` chunk.
+
+    If the underlying stream raises mid-iteration, ``on_finish`` still runs
+    via ``finally`` and records partial usage (estimated from streamed text
+    when no usage chunk arrived). This is intentional — partial cost is
+    still billable.
     """
 
     def __init__(self, stream: Any, provider: str, on_finish: Optional[Callable] = None):
@@ -153,6 +159,56 @@ class StreamWrapper:
                     "source": "api_reported",
                 }
         return None
+
+
+class _ProxyWrapper:
+    """Non-mutating proxy that wraps a client without monkey-patching.
+
+    Use :meth:`InterceptionLayer.wrap_proxy` for SDKs where mutating the
+    original object is undesirable (e.g. shared clients or strict mocks).
+
+    Supports dotted ``attr_path`` like ``"chat.completions.create"`` by
+    recursively wrapping intermediate attributes.
+    """
+
+    def __init__(self, client: Any, interceptor: "InterceptionLayer", provider: str, attr_path: str):
+        object.__setattr__(self, "_client", client)
+        object.__setattr__(self, "_interceptor", interceptor)
+        object.__setattr__(self, "_provider", provider)
+        object.__setattr__(self, "_attr_path", attr_path)
+
+    def __getattr__(self, name: str) -> Any:
+        client = object.__getattribute__(self, "_client")
+        try:
+            attr = getattr(client, name)
+        except AttributeError:
+            raise
+        attr_path = object.__getattribute__(self, "_attr_path")
+        # Exact leaf match
+        if attr_path == name:
+            if callable(attr):
+                return object.__getattribute__(self, "_interceptor")._make_tracked_fn(
+                    attr, object.__getattribute__(self, "_provider")
+                )
+            return attr
+        # Intermediate segment: e.g. attr_path="chat.completions.create", name="chat"
+        if attr_path.startswith(name + "."):
+            remaining = attr_path[len(name) + 1 :]
+            return _ProxyWrapper(attr, object.__getattribute__(self, "_interceptor"), object.__getattribute__(self, "_provider"), remaining)
+        return attr
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # Allow setting proxy internals during __init__; otherwise delegate
+        if name in {"_client", "_interceptor", "_provider", "_attr_path"}:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(object.__getattribute__(self, "_client"), name, value)
+
+    def __repr__(self) -> str:
+        return f"<TokenLedgerProxy provider={object.__getattribute__(self, '_provider')} attr={object.__getattribute__(self, '_attr_path')} client={object.__getattribute__(self, '_client')!r}>"
+
+    def __dir__(self) -> list[str]:
+        return dir(object.__getattribute__(self, "_client"))
 
 
 class InterceptionLayer:
@@ -237,6 +293,13 @@ class InterceptionLayer:
         self._original_methods[client_id][attr_path] = original
         setattr(parent, parts[-1], self._make_tracked_fn(original, provider))
         return client
+
+    def wrap_proxy(self, client: Any, attr_path: str, provider: str) -> Any:
+        """Return a proxy wrapping *client* without mutating the original.
+
+        Example: ``proxy = interceptor.wrap_proxy(client, "chat.completions.create", "openai")``
+        """
+        return _ProxyWrapper(client, self, provider, attr_path)
 
     def wrap_openai(self, client: Any, provider: str = "openai") -> Any:
         return self._wrap_attr(client, "chat.completions.create", provider)
@@ -366,9 +429,8 @@ class InterceptionLayer:
         delay = retry_delay
         for attempt in range(max_retries + 1):
             try:
-                if req_timeout and attempt == 0:
-                    kwargs = {**kwargs, "timeout": req_timeout}
-                return original(*args, **kwargs)
+                call_kwargs = {**kwargs, "timeout": req_timeout} if req_timeout else kwargs
+                return original(*args, **call_kwargs)
             except Exception as e:
                 if attempt < max_retries and _is_transient(e):
                     logger.warning("Retry %d/%d for %s: %s", attempt + 1, max_retries, provider, e)
@@ -389,11 +451,10 @@ class InterceptionLayer:
         delay = retry_delay
         for attempt in range(max_retries + 1):
             try:
-                if req_timeout and attempt == 0:
-                    kwargs = {**kwargs, "timeout": req_timeout}
+                call_kwargs = {**kwargs, "timeout": req_timeout} if req_timeout else kwargs
                 if req_timeout:
-                    return await asyncio.wait_for(original(*args, **kwargs), timeout=req_timeout)
-                return await original(*args, **kwargs)
+                    return await asyncio.wait_for(original(*args, **call_kwargs), timeout=req_timeout)
+                return await original(*args, **call_kwargs)
             except Exception as e:
                 if attempt < max_retries and _is_transient(e):
                     logger.warning("Async retry %d/%d for %s: %s", attempt + 1, max_retries, provider, e)
@@ -443,12 +504,18 @@ class InterceptionLayer:
                 raise UnknownModelError(f"Unknown model: {provider}:{metadata['model']}")
             if self.unknown_model_policy == "allow":
                 record["cost_usd"] = 0.0
+                record["_allow_zero_cost"] = True
         sysmon = getattr(self.ledger, "system_monitor", None)
         if sysmon:
             record["system"] = sysmon.snapshot()
         if self.ghost_mode:
             record["_ghost"] = True
         record = self.verifier.verify(record, raw_response)
+        # Ghost persist optimization: allow dropping ghost records to save I/O
+        if record.get("_ghost") and not getattr(self.ledger, "ghost_persist", True):
+            if self.on_record:
+                self.on_record(record)
+            return
         self.store.insert_record(record)
         if self.on_record:
             self.on_record(record)
@@ -550,8 +617,7 @@ class InterceptionLayer:
         except Exception:
             self._record_result(provider, False)
             raise
-        finally:
-            latency_ms = (time.monotonic() - start_time) * 1000
+        latency_ms = (time.monotonic() - start_time) * 1000
         self._record_result(provider, True)
 
         if kwargs.get("stream"):
@@ -571,8 +637,7 @@ class InterceptionLayer:
         except Exception:
             self._record_result(provider, False)
             raise
-        finally:
-            latency_ms = (time.monotonic() - start_time) * 1000
+        latency_ms = (time.monotonic() - start_time) * 1000
         self._record_result(provider, True)
 
         if kwargs.get("stream"):
@@ -594,7 +659,3 @@ class InterceptionLayer:
             tenant_id=metadata.get("tenant_id"),
         )
         self.store.insert_record(record)
-
-
-class UnknownModelError(Exception):
-    """Raised when an unknown model is encountered and policy is 'block'."""

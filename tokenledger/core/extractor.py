@@ -27,8 +27,23 @@ class TokenExtractor:
         "perplexity": "_parse_openai",
     }
 
+    def __init__(self) -> None:
+        self._custom_parsers: dict[str, Any] = {}
+
+    def register_parser(self, provider: str, parser: Any) -> None:
+        """Register a custom parser for a provider.
+
+        ``parser`` is a callable ``(response) -> dict | None``.
+        """
+        self._custom_parsers[provider] = parser
+
     def extract(self, response: Any, provider: str) -> Optional[dict[str, Any]]:
         """Extract token usage from a provider response."""
+        if provider in self._custom_parsers:
+            try:
+                return self._custom_parsers[provider](response)
+            except Exception:
+                return None
         parser_name = self.PROVIDER_PARSERS.get(provider, "_parse_generic")
         parser = getattr(self, parser_name, self._parse_generic)
         return parser(response)

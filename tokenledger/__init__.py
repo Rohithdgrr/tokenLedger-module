@@ -3,11 +3,10 @@ TokenLedger - Lightweight governance layer for LLM applications.
 Zero database required.
 """
 
-from .core.budget import BudgetExceededError
-from .core.interceptor import CircuitBreakerOpenError, UnknownModelError
+from .core.exceptions import BudgetExceededError, CircuitBreakerOpenError, UnknownModelError, WalletExhaustedError
 from .core.ledger import TokenLedger
 from .core.store import MemoryStore
-from .core.wallet import Wallet, WalletExhaustedError
+from .core.wallet import Wallet
 from .ext.autodetect import auto_detect
 from .ext.differentiators import (
     CostContract,
@@ -27,7 +26,12 @@ from .ext.differentiators import (
 from .ext.live_server import LiveServer
 from .ext.logging_adapter import attach_log_handler, detach_log_handler
 
-__version__ = "1.5.0"
+try:
+    from importlib.metadata import version as _pkg_version
+
+    __version__ = _pkg_version("tokenledger-module")
+except Exception:
+    __version__ = "1.5.0"
 __all__ = [
     "TokenLedger",
     "MemoryStore",

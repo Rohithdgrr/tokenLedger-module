@@ -23,13 +23,34 @@ class AnalyticsEngine:
         scope: str = "global",
         scope_id: str = "all",
         top_k: int = 5,
+        apply_dp: bool = False,
+        epsilon: float | None = None,
     ) -> dict[str, Any]:
         """Get summary statistics with budget utilization, top models, and anomalies.
 
         Top models/providers are read from the store's running totals (O(1),
         no record scan) so ghost/blocked records never leak into rankings.
+
+        When ``apply_dp`` is True, Laplace noise is added to aggregate
+        counts (scale=1/epsilon) rather than per-record, avoiding noise
+        compounding.
         """
+        import math
+        import secrets
+
+        def _laplace(scale: float) -> float:
+            u = 1e-12 + secrets.randbelow(2**53) / 2**53 * (1.0 - 2e-12)
+            return scale * math.log(2 * u) if u < 0.5 else -scale * math.log(2 * (1 - u))
+
         base = self.store.get_running_totals(scope, scope_id)
+        if apply_dp:
+            eps = epsilon or 1.0
+            scale = 1.0 / eps
+            # Add noise to aggregates (not per-record)
+            for k in ("requests", "input_tokens", "output_tokens", "total_tokens"):
+                base[k] = max(0, int(base.get(k, 0) + _laplace(scale)))
+            base["cost_usd"] = max(0.0, float(base.get("cost_usd", 0) + _laplace(scale * 0.001)))
+            base["_dp_noise_applied"] = True
         budgets = self.store.get_all_budgets()
 
         base["budget_count"] = len(budgets)
@@ -89,14 +110,8 @@ class AnalyticsEngine:
 
     def get_trend(self, dimension: str, dimension_id: str, granularity: str = "day") -> list[dict[str, Any]]:
         """Get time-series trend data."""
-        slice_lengths = {
-            "hour": 13,
-            "day": 10,
-            "week": 10,
-            "month": 7,
-        }
+        from datetime import datetime
 
-        slice_len = slice_lengths.get(granularity, 10)
         buckets: dict[str, dict[str, Any]] = {}
 
         for record in self.store.get_records():
@@ -104,10 +119,21 @@ class AnalyticsEngine:
                 continue
 
             timestamp = record.get("timestamp", "")
-            if len(timestamp) < slice_len:
+            try:
+                dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
                 continue
 
-            bucket_key = timestamp[:slice_len]
+            if granularity == "hour":
+                bucket_key = dt.strftime("%Y-%m-%dT%H")
+            elif granularity == "day":
+                bucket_key = dt.strftime("%Y-%m-%d")
+            elif granularity == "week":
+                bucket_key = dt.strftime("%Y-W%W")
+            elif granularity == "month":
+                bucket_key = dt.strftime("%Y-%m")
+            else:
+                bucket_key = dt.strftime("%Y-%m-%d")
 
             if bucket_key not in buckets:
                 buckets[bucket_key] = {
@@ -155,13 +181,52 @@ class AnalyticsEngine:
         }
 
     def get_budget_utilization(self, scope: str, scope_id: str) -> Optional[dict[str, Any]]:
-        """Get current budget utilization percentage."""
+        """Get current budget utilization percentage (window-aware)."""
+        from datetime import datetime, timedelta, timezone
+
         budget = self.store.get_budget(scope, scope_id)
         if not budget:
             return None
 
+        # Respect reset_cycle window; fall back to full history for 'never'
+        reset_cycle = budget.get("reset_cycle", "monthly")
+        window_start: Optional[str] = None
+        if reset_cycle != "never":
+            now = datetime.now(timezone.utc)
+            if reset_cycle == "daily":
+                window_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+            elif reset_cycle == "weekly":
+                window_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+            elif reset_cycle == "monthly":
+                window_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+            else:
+                window_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+            # Try optimized store path
+            if hasattr(self.store, "get_windowed_spend"):
+                try:
+                    optimized = self.store.get_windowed_spend(budget, window_start)  # type: ignore[operator]
+                    if optimized is not None:
+                        total_spent = float(optimized)
+                        limit = budget.get("limit_usd", 0)
+                        utilization = (total_spent / limit * 100) if limit > 0 else 0
+                        return {
+                            "scope": scope,
+                            "scope_id": scope_id,
+                            "limit_usd": limit,
+                            "spent_usd": round(total_spent, 4),
+                            "remaining_usd": round(limit - total_spent, 4),
+                            "utilization_percent": round(utilization, 2),
+                            "reset_cycle": reset_cycle,
+                        }
+                except Exception:
+                    pass
+
         total_spent = 0.0
         for record in self.store.get_records():
+            if window_start and record.get("timestamp", "") < window_start:
+                continue
+            if record.get("status") in ("blocked", "error") or record.get("_ghost"):
+                continue
             if self._matches_budget_scope(record, budget):
                 total_spent += record.get("cost_usd", 0)
 

@@ -7,26 +7,12 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from .exceptions import BudgetExceededError
 from .pricing import PricingRegistry
 from .store import StorageBackend
 
-
-class BudgetExceededError(Exception):
-    """Raised when a budget limit is exceeded."""
-
-    def __init__(
-        self,
-        message: str,
-        scope: str = "",
-        scope_id: str = "",
-        current_spend: float = 0.0,
-        limit: float = 0.0,
-    ):
-        super().__init__(message)
-        self.scope = scope
-        self.scope_id = scope_id
-        self.current_spend = current_spend
-        self.limit = limit
+# Re-export for backwards compatibility
+__all__ = ["BudgetExceededError"]
 
 
 class BudgetEnforcer:
@@ -100,6 +86,9 @@ class BudgetEnforcer:
         totals for O(1) lookups. ``user_project`` spends always use the
         intersection scan because no running-total dimension captures both
         dimensions at once.
+
+        If the store implements :meth:`get_windowed_spend`, that indexed
+        path is preferred (e.g. SQLite SUM query).
         """
         scope = budget.get("scope", "global")
         scope_id = budget.get("scope_id", "")
@@ -111,6 +100,14 @@ class BudgetEnforcer:
             return round(float(totals.get("cost_usd", 0)), 10)
 
         window_start = self._get_window_start(reset_cycle)
+        # Try store-optimized path first
+        if hasattr(self.store, "get_windowed_spend"):
+            try:
+                optimized = self.store.get_windowed_spend(budget, window_start)  # type: ignore[operator]
+                if optimized is not None:
+                    return round(float(optimized), 10)
+            except Exception:
+                pass
         total = 0.0
         for record in self.store.get_records():
             ts = record.get("timestamp", "")
