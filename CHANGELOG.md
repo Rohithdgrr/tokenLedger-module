@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.5.2 (2026-08-21)
+
+Targeted fixes for 4 audit findings (of 35 triaged — remainder are design tradeoffs or stale):
+
+- **Budget race**: `BudgetEnforcer._calculate_current_spend` for `never` budgets now reads via `store.get_running_totals()` (lock-guarded) instead of direct `running_totals` dict access — closes TOCTOU with concurrent `insert_record`
+- **Encrypted persistence**: `MemoryStore._append_to_disk` uses atomic `tmp + os.replace` for Fernet/XOR blobs, avoiding truncation on crash between `open("wb")` and `fsync`
+- **Logging adapter**: `detach_log_handler` uses `WeakKeyDictionary.pop` with sentinel, no `in`+`del` race and correctly restores `None` originals
+- **Never-budget sentinel**: `_get_window_start("never")` returns `1970-01-01T00:00:00` (naive UTC, lex-comparable with `normalize_ts`) instead of `0001-01-01` `datetime.min`
+
 ## v1.5.1 (2026-08-21)
 
 Two audit hardening passes (50+ fixes) plus a third-pass review round:

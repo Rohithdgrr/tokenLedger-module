@@ -32,7 +32,7 @@ try:
 
     __version__ = _pkg_version("tokenledger-module")
 except Exception:
-    __version__ = "1.5.1"
+    __version__ = "1.5.2"
 __all__ = [
     "TokenLedger",
     "MemoryStore",

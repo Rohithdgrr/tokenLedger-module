@@ -76,8 +76,9 @@ def detach_log_handler(
     current = ledger.interceptor.on_record
     if hook is not None and current is not hook:
         return
-    if ledger in _PREVIOUS:
-        ledger.interceptor.on_record = _PREVIOUS.get(ledger)
-        del _PREVIOUS[ledger]
+    _sentinel: object = object()
+    previous = _PREVIOUS.pop(ledger, _sentinel)  # type: ignore[arg-type]
+    if previous is not _sentinel:
+        ledger.interceptor.on_record = previous  # type: ignore[assignment]
     elif hook is not None:
         ledger.interceptor.on_record = None

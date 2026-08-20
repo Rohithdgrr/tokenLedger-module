@@ -335,10 +335,12 @@ class MemoryStore(StorageBackend):
             if self.encryption_key:
                 payload = self._serialize_lines()
                 payload = _encrypt(payload, self.encryption_key)
-                with open(self.persist_path, "wb") as f:
+                tmp_path = self.persist_path + ".tmp"
+                with open(tmp_path, "wb") as f:
                     f.write(payload)
                     f.flush()
                     os.fsync(f.fileno())
+                os.replace(tmp_path, self.persist_path)
             else:
                 # Append only the newest record — O(1) instead of rewriting N records
                 record = self.records[-1] if self.records else None

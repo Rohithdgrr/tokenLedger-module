@@ -150,8 +150,7 @@ class BudgetEnforcer:
         reset_cycle = budget.get("reset_cycle", "monthly")
 
         if reset_cycle == "never" and scope != "user_project":
-            key = "global:all" if scope == "global" else f"{scope}:{scope_id}"
-            totals = self.store.running_totals.get(key, {})
+            totals = self.store.get_running_totals(scope, scope_id)
             return round(float(totals.get("cost_usd", 0)), 10)
 
         window_start = self._get_window_start(reset_cycle)
@@ -198,8 +197,9 @@ class BudgetEnforcer:
         """Get the start of the current budget window."""
         now = datetime.now(timezone.utc)
         if reset_cycle == "never":
-            # datetime.min is already naive — keep it as-is.
-            return datetime.min.isoformat()
+            # Use a fixed epoch sentinel — naive UTC so it compares correctly
+            # with normalize_ts() timestamps (which are also naive UTC).
+            return "1970-01-01T00:00:00"
         if reset_cycle == "daily":
             start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         elif reset_cycle == "weekly":
