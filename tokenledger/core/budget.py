@@ -54,6 +54,8 @@ class BudgetEnforcer:
         max_tokens: Optional[int] = None,
     ) -> bool:
         """Check if the request is within budget."""
+        if not self.store.get_all_budgets():
+            return True
         applicable_budgets = self._get_applicable_budgets(user_id, project_id)
 
         for budget_key, budget in applicable_budgets:

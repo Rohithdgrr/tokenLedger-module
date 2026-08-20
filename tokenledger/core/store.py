@@ -64,6 +64,9 @@ def _is_billable(record: dict[str, Any]) -> bool:
     return record.get("status") not in ("blocked", "error")
 
 
+_RETENTION_CHECK_INTERVAL_S = 60.0
+
+
 class RetentionPolicy:
     def __init__(self, max_age_days: int = 90, max_records: int = 100_000, archive_on_trim: bool = True):
         self.max_age_days = max_age_days
@@ -72,6 +75,14 @@ class RetentionPolicy:
 
 
 def _checksum(record: dict[str, Any]) -> str:
+    # Records are built in a deterministic key order, so sort_keys is
+    # unnecessary — one dumps + hash pass is ~2x faster per record.
+    raw = json.dumps(record, default=str).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _checksum_sorted(record: dict[str, Any]) -> str:
+    """Legacy sort-keys checksum used by files written before v1.5.1."""
     raw = json.dumps(record, sort_keys=True, default=str).encode()
     return hashlib.sha256(raw).hexdigest()
 
@@ -167,6 +178,7 @@ class MemoryStore(StorageBackend):
         self.persist_path = persist_path
         self.encryption_key = _normalize_key(encryption_key) if encryption_key else None
         self.retention = RetentionPolicy(max_age_days=retention_days, max_records=max_records, archive_on_trim=True)
+        self._last_retention_check: Optional[datetime] = None
         if persist_path and os.path.exists(persist_path):
             self._load_from_disk()
 
@@ -310,9 +322,22 @@ class MemoryStore(StorageBackend):
             self.running_totals.clear()
             self.budgets.clear()
 
-    def _apply_retention(self) -> None:
+    def _apply_retention(self, force: bool = False) -> None:
+        """Prune records older than ``max_age_days`` (amortized).
+
+        The age scan is throttled to once per ``_RETENTION_CHECK_INTERVAL_S``
+        so inserts stay O(1) — the deque's maxlen already enforces the record
+        ring buffer on every insert. Callers acting explicitly
+        (``compact``/``apply_retention``) pass ``force=True``.
+        """
         if self.retention.max_age_days < 0:
             return
+        if not force:
+            now = datetime.now(timezone.utc)
+            last = self._last_retention_check
+            if last is not None and (now - last).total_seconds() < _RETENTION_CHECK_INTERVAL_S:
+                return
+            self._last_retention_check = now
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.retention.max_age_days)
         pruned = []
         for r in self.records:
@@ -350,7 +375,7 @@ class MemoryStore(StorageBackend):
             before = len(self.records)
             if max_age_days is not None:
                 self.retention.max_age_days = max_age_days
-            self._apply_retention()
+            self._apply_retention(force=True)
             after = len(self.records)
             return {"removed": before - after, "remaining": after}
 
@@ -358,7 +383,7 @@ class MemoryStore(StorageBackend):
         with self.lock:
             if max_age_days is not None:
                 self.retention.max_age_days = max_age_days
-            self._apply_retention()
+            self._apply_retention(force=True)
 
     def get_record_count(self) -> int:
         with self.lock:
@@ -371,6 +396,8 @@ class MemoryStore(StorageBackend):
             if not expected:
                 continue
             actual = _checksum({k: v for k, v in r.items() if k != "_checksum"})
+            if actual != expected:
+                actual = _checksum_sorted({k: v for k, v in r.items() if k != "_checksum"})
             if expected != actual:
                 tampered.append(r.get("record_id", "unknown"))
         return tampered
