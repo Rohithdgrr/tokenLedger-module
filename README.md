@@ -21,7 +21,7 @@ The package works by **wrapping LLM API calls**. When a request is made, TokenLe
 - **System Monitoring** — Optional CPU, RAM, disk, GPU, network, temperature, and power metrics attached to usage records.
 - **Smart Estimation** — When APIs don't report token counts, TokenLedger estimates using `tiktoken` or character heuristics.
 - **Resilience** — Configurable retry with backoff, circuit breaker (per-provider), rate limiter (token bucket), and request timeout.
-- **CLI** — `tokenledger summary|export|verify|compact|health|update-pricing` from the terminal.
+- **CLI** — `tokenledger summary|export|verify|compact|health|update-pricing|cost` from the terminal.
 - **SQLite Storage** — Optional SQLite backend via `TokenLedger(store=SqliteStore("usage.db"))`.
 - **Multi-Tenant** — `tenant_id` dimension for isolating usage across organizations or environments.
 - **Encryption-at-Rest** — Persisted JSONL is encrypted with Fernet (AES-128-CBC + HMAC) via `encryption_key` when `cryptography` is installed; falls back to HMAC-tagged XOR obfuscation otherwise.
@@ -36,6 +36,11 @@ The package works by **wrapping LLM API calls**. When a request is made, TokenLe
 - **Data Retention** — Configurable max_records ring buffer and age-based retention policies.
 - **Immutable Event Logs** — SHA-256 checksums on all records with tamper detection and verification.
 - **Export** — Generate CSV or JSON reports for auditing and analysis.
+- **Live Spend Server** — `ledger.serve()` (or `LiveServer`) exposes `/stats` (JSON snapshot) and `/stream` (Server-Sent Events per usage) over stdlib HTTP for dashboards.
+- **Budget Wallets** — Per-user prepaid allowances with reserve-checking `debit()`, `refill()`, live `balance()`, and a one-shot low-balance alarm.
+- **Usage Blocks** — `with ledger.usage(...)` / `async with` measure block latency and auto-record (tokens estimated from messages, `status="error"` on exception).
+- **Logging Adapter** — `attach_log_handler(ledger)` streams every usage record into `logging` as structured fields.
+- **Cost Preview** — `ledger.cost_preview(...)` or CLI `tokenledger cost "prompt" --model gpt-4o` estimates tokens and cost without recording.
 
 ---
 
@@ -303,6 +308,61 @@ def ask_llm(messages):
 from tokenledger.ext.sqlite_store import SqliteStore
 
 ledger = TokenLedger(store=SqliteStore("usage.db"))
+```
+
+### Live Spend Server
+
+```python
+with ledger.serve(host="127.0.0.1", port=8765):   # context manager stops the server
+    ...  # GET http://127.0.0.1:8765/stats   -> JSON snapshot
+         # GET http://127.0.0.1:8765/stream  -> Server-Sent Events per usage record
+```
+
+Pure-stdlib daemon server (no dependencies). `/stream` emits `event: record` messages with a 15-second keepalive heartbeat; CORS is enabled so browser dashboards can consume both endpoints. Existing `on_record` hooks (notifiers, exporters) keep working — the server chains them and restores them on `stop()`.
+
+### Budget Wallets
+
+```python
+wallet = ledger.create_wallet("alice", limit_usd=10.0, low_balance_threshold=0.2,
+                              on_low_balance=lambda w: send_alert(w.user_id, w.balance()))
+wallet.debit("openai", "gpt-4o", input_tokens=100, output_tokens=50)  # raises WalletExhaustedError if it would exceed
+wallet.balance()    # remaining allowance in USD
+wallet.refill(5.0)  # top up and return the new limit
+wallet.reset()      # reset the cycle and re-arm the low-balance alarm
+```
+
+`WalletExhaustedError` subclasses `BudgetExceededError`, so existing handlers keep working. The low-balance callback fires at most once per cycle and re-arms on `refill()`/`reset()`.
+
+### Usage Blocks
+
+```python
+with ledger.usage("openai", "gpt-4o", messages=[{"role": "user", "content": "hello"}],
+                  user_id="alice", conversation_id="c-42"):
+    reply = client.chat.completions.create(...)
+
+# async:  async with ledger.usage("openai", "gpt-4o", messages=...): ...
+
+# cost_preview(): estimate without recording anything
+ledger.cost_preview([{"role": "user", "content": "hello"}], "gpt-4o", "openai")
+```
+
+Records on block exit with `source="usage_block"`, latency measured from entry, tokens estimated from `messages` (plus `output_text` when supplied), and `status="error"` if the block raised.
+
+### Logging Adapter
+
+```python
+from tokenledger import attach_log_handler, detach_log_handler
+
+hook = attach_log_handler(ledger)   # logs to "tokenledger.spend" at INFO
+# structured fields land in LogRecord.extra: provider, model, input_tokens,
+# output_tokens, total_tokens, cost_usd, latency_ms, status, user_id, ...
+detach_log_handler(ledger, hook)    # restores the previous on_record sink
+```
+
+### CLI Cost Preview
+
+```bash
+tokenledger cost "Explain tokenization." --model gpt-4o --provider openai --output-text "A summary."
 ```
 
 ### Multi-Tenant

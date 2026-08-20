@@ -289,6 +289,27 @@ def cmd_health(args: Any) -> None:
     console.print(table)
 
 
+def cmd_cost(args: Any) -> None:
+    ledger = _build_ledger(args)
+    preview = ledger.cost_preview(
+        [{"role": "user", "content": args.text}],
+        args.model,
+        args.provider,
+        output_text=args.output_text,
+    )
+    table = Table(title="Cost Preview", box=box.SIMPLE, border_style=LIGHT_THEME["border"])
+    table.add_column("Metric", style=LIGHT_THEME["accent"])
+    table.add_column("Value", style=LIGHT_THEME["fg"])
+    table.add_row("Provider", preview.get("provider", args.provider))
+    table.add_row("Model", preview.get("model", args.model))
+    table.add_row("Input Tokens", f"{preview.get('input_tokens', 0):,}")
+    table.add_row("Output Tokens", f"{preview.get('output_tokens', 0):,}")
+    table.add_row("Total Tokens", f"{preview.get('total_tokens', 0):,}")
+    table.add_row("Estimated Cost", _format_cost(preview.get("cost_usd", 0.0)))
+    table.add_row("Pricing Source", (preview.get("source") or "bundled pricing"))
+    console.print(table)
+
+
 COMMANDS: dict[str, Any] = {
     "summary": cmd_summary,
     "export": cmd_export,
@@ -296,6 +317,7 @@ COMMANDS: dict[str, Any] = {
     "compact": cmd_compact,
     "health": cmd_health,
     "update-pricing": cmd_update_pricing,
+    "cost": cmd_cost,
 }
 
 
@@ -505,6 +527,13 @@ def main() -> None:
     p_pricing = sub.add_parser("update-pricing", help="Reload pricing from external JSON file")
     p_pricing.add_argument("--pricing-file", help="Path to pricing JSON file (defaults to bundled data)")
     p_pricing.set_defaults(func=cmd_update_pricing)
+
+    p_cost = sub.add_parser("cost", help="Estimate tokens and cost without recording")
+    p_cost.add_argument("text", help="Prompt text to estimate")
+    p_cost.add_argument("--model", default="gpt-4o", help="Model name (default: gpt-4o)")
+    p_cost.add_argument("--provider", default="openai", help="Provider name (default: openai)")
+    p_cost.add_argument("--output-text", help="Optional completion text to estimate output tokens")
+    p_cost.set_defaults(func=cmd_cost)
 
     argv = sys.argv[1:]
     has_subcommand = any(a in argv for a in COMMANDS)

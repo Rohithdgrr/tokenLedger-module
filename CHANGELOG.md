@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.5.0 (2026-08-20)
+
+- **Live spend server**: `ledger.serve(host, port)` (or `LiveServer`) runs a stdlib daemon HTTP server — `GET /stats` returns a JSON snapshot (requests, tokens, cost, per-provider breakdown, running totals) and `GET /stream` pushes Server-Sent Events per recorded usage with a 15s keepalive heartbeat; CORS enabled for browser dashboards; chains (never clobbers) any existing `on_record` hook and restores it on `stop()`
+- **Budget wallets**: `ledger.create_wallet(user_id, limit_usd, reset_cycle, low_balance_threshold, on_low_balance)` — prepaid per-user allowances over the existing budget engine; `debit()` reserves estimated request cost and raises `WalletExhaustedError` (subclass of `BudgetExceededError`) when the allowance would be exceeded; `refill()`, `balance()`, `spend()`, `reset()`; one-shot low-balance alarm re-armed by refill/reset
+- **Usage context managers**: `with ledger.usage(provider, model, messages=..., ...)` and `async with` — measures block latency, records tokens estimated from messages (plus `output_text` when supplied), flags `source="usage_block"` and `status="error"` when the block raises
+- **Logging adapter**: `attach_log_handler(ledger, logger_name="tokenledger.spend")` emits every usage record as a structured log entry with fields attached via `extra` (provider, model, tokens, cost, latency, status, user/tenant/conversation/agent ids, source, timestamp); preserves the callback chain; `detach_log_handler()` restores the previous sink
+- **Instant cost preview**: `ledger.cost_preview(messages, model, provider, output_text)` estimates tokens and cost without storing anything; CLI `tokenledger cost "text" --model gpt-4o [--provider openai] [--output-text ...]` renders the same preview as a table
+- `__version__` bumped to 1.5.0; new exports: `Wallet`, `WalletExhaustedError`, `LiveServer`, `attach_log_handler`, `detach_log_handler`
+- Test suite: **270 tests** (31 new in `tests/test_features.py`), coverage **88%** (gate 80%), ruff clean, bandit 0 findings, mypy still at the 12 pre-existing `ext/` baseline
+
 ## v1.4.0 (2026-08-19)
 
 - **Real encryption-at-rest**: `encryption_key` now uses Fernet (AES-128-CBC + HMAC) when `cryptography` is installed — new `[security]` extra (`pip install "tokenledger-module[security]"`); HMAC-tagged XOR remains only as the no-dependency fallback, and legacy XOR files still load. Import is lazy (startup stays fast), docs updated (README, docs/)

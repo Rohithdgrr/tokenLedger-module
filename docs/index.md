@@ -48,8 +48,10 @@ print(f"Spent: ${summary['cost_usd']:.4f}")
 | **Storage** | In-memory (default), JSONL persist, SQLite, pluggable `StorageBackend` protocol, ring buffer, age-based retention, Fernet AES encryption-at-rest |
 | **Analytics** | Summary (budgets, top models, anomalies), spending by provider/model/user/project/conversation/agent/tenant, trends (hour/day/week/month), latency stats (p50/p95/p99), efficiency, cost breakdown |
 | **Verification** | 6 built-in rules (token arithmetic, negative token, cost recalculation, unknown model, negative latency, anomaly detection), pluggable `VerificationRule` ABC, SHA-256 checksums with tamper detection |
-| **CLI** | `summary`, `export` (csv/json), `verify`, `compact`, `health`, `update-pricing` |
+| **CLI** | `summary`, `export` (csv/json), `verify`, `compact`, `health`, `update-pricing`, `cost` (instant preview) |
 | **Extras** | OpenTelemetry instrumentation, Webhook/Slack notifier, async store wrapper, `@ledger.track` decorator, per-provider config, external pricing via JSON, `get_health()` |
+| **Live** | `ledger.serve()` HTTP server — `/stats` JSON + `/stream` Server-Sent Events with 15s heartbeat, CORS for dashboards, `on_record` hook chaining |
+| **Spend Control** | Budget wallets (`create_wallet`, reserve-checking `debit()`, `refill()`, `balance()`, one-shot low-balance alarm), usage context managers (`with ledger.usage(...)` sync + async), logging adapter (`attach_log_handler`), cost preview (`cost_preview()`)
 | **Privacy** | Prompt redaction (SHA-256 hash), Fernet AES encryption-at-rest (XOR+HMAC fallback), differential privacy (Laplace noise at export/query boundary) |
 | **Differentiators** | Ghost mode (dry-run), what-if cost simulator, agent/conversation ROI, signed offline ledgers (HMAC), prompt cache with near-duplicate detection, self-improving estimator, smart model router, agentic cost contracts, prompt evolution tracker, local LLM real-cost modeling |
 

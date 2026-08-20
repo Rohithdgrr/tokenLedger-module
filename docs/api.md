@@ -38,6 +38,29 @@ Wrap provider client for automatic tracking.
 #### `set_budget(scope, scope_id, limit_usd, reset_cycle="monthly")`
 Define spending limits.
 
+#### `usage(provider, model, messages=None, output_text=None, **kwargs)`
+Context manager (sync and async) that records one usage event on block exit:
+latency measured from entry, tokens estimated from `messages`/`output_text`,
+`source="usage_block"`, `status="error"` if the block raised. Extra kwargs
+(`user_id`, `tenant_id`, `conversation_id`, ...) pass through to `record_usage`.
+
+```python
+with ledger.usage("openai", "gpt-4o", messages=[...], user_id="alice"):
+    ...  # app code
+async with ledger.usage("openai", "gpt-4o", messages=[...]):
+    ...  # async app code
+```
+
+#### `cost_preview(messages, model, provider, output_text=None) -> dict`
+Estimate tokens and cost without recording anything. Returns
+`{input_tokens, output_tokens, total_tokens, cost_usd, source}`.
+
+#### `create_wallet(user_id, limit_usd, reset_cycle="daily", low_balance_threshold=0.2, on_low_balance=None) -> Wallet`
+Create a per-user prepaid allowance wallet (see `Wallet` below).
+
+#### `serve(host="127.0.0.1", port=8765) -> LiveServer`
+Build a live spend server bound to this ledger (see `LiveServer` below).
+
 #### `get_summary(scope="global", scope_id="all")`
 Aggregated usage statistics with budget utilization, top models, anomalies.
 
@@ -77,6 +100,32 @@ Aggregated usage statistics with budget utilization, top models, anomalies.
 ### StorageBackend (ABC)
 - `MemoryStore` — In-memory with JSONL persist, ring buffer, obfuscation-at-rest
 - `SqliteStore(path)` — SQLite-backed storage
+
+### Wallet
+Per-user prepaid allowance built on the budget engine.
+
+- `debit(provider, model, messages=None, input_tokens=0, output_tokens=0, max_tokens=None) -> bool` — reserve estimated request cost; raises `WalletExhaustedError` (subclass of `BudgetExceededError`) if the allowance would be exceeded; fires the one-shot `on_low_balance` alarm when balance drops below `low_balance_threshold * limit`
+- `balance() -> float` — remaining allowance in USD
+- `spend() -> float` — spend inside the current reset window
+- `refill(amount) -> float` — top up; returns the new limit; re-arms the alarm if above threshold
+- `reset()` — reset the cycle and re-arm the alarm
+- `limit` — current allowance
+- `WalletExhaustedError(BudgetExceededError)` — attributes `scope`, `scope_id`, `current_spend`, `limit`
+
+### LiveServer
+Pure-stdlib daemon HTTP server for live spend visibility.
+
+- `start() -> LiveServer` — bind and serve in a daemon thread; installs an `on_record` hook (chaining any previous one)
+- `stop()` — shut down, remove the hook, restore the previous `on_record`
+- `__enter__` / `__exit__` — context manager lifecycle
+- `GET /stats` — JSON: `record_count`, `total_tokens`, `cost_usd`, `providers` (per-provider breakdown), `running_totals` (`global:all`), `generated_at`
+- `GET /stream` — Server-Sent Events: `event: record` per usage record, `: ping` heartbeat every 15s; CORS enabled
+- Create via `ledger.serve(host, port)` or `LiveServer(ledger, host, port)`; pass `port=0` for an ephemeral port (read `server.port` after `start()`)
+
+### Logging Adapter
+
+- `attach_log_handler(ledger, logger_name="tokenledger.spend", level=logging.INFO) -> hook` — install an `on_record` callback that logs every usage record with fields attached as `LogRecord` `extra` (`provider`, `model`, `input_tokens`, `output_tokens`, `total_tokens`, `cost_usd`, `latency_ms`, `status`, `user_id`, `project_id`, `tenant_id`, `conversation_id`, `agent_id`, `source`, `timestamp`); preserves and chains the previous callback
+- `detach_log_handler(ledger, hook=None)` — restore the callback active before attachment
 
 ### VerificationEngine
 - `add_rule(rule)` — add custom `VerificationRule`

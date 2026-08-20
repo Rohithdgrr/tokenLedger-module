@@ -10,7 +10,11 @@ import math
 import secrets
 import time
 from datetime import datetime, timezone
-from typing import Any, Callable, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Literal, TypeVar
+
+if TYPE_CHECKING:
+    from ..ext.live_server import LiveServer
+    from .wallet import Wallet
 
 from ..ext.differentiators import (
     CostContract,
@@ -48,6 +52,64 @@ from .system import SystemMonitor
 from .verifier import VerificationEngine
 
 F = TypeVar("F", bound=Callable)
+
+
+class _UsageContext:
+    """Context manager returned by :meth:`TokenLedger.usage` (sync + async)."""
+
+    def __init__(
+        self,
+        ledger: TokenLedger,
+        provider: str,
+        model: str,
+        messages: list[dict[str, Any]] | None,
+        output_text: str | None,
+        **kwargs: Any,
+    ):
+        self._ledger = ledger
+        self._provider = provider
+        self._model = model
+        self._messages = messages
+        self._output_text = output_text
+        self._kwargs = kwargs
+        self._start = time.monotonic()
+
+    def _record(self, status: str) -> None:
+        latency = round((time.monotonic() - self._start) * 1000, 3)
+        if self._messages:
+            est = self._ledger.estimator.estimate(
+                messages=self._messages,
+                model=self._model,
+                provider=self._provider,
+                output_text=self._output_text,
+            )
+            inp, out = est["input_tokens"], est["output_tokens"]
+        else:
+            inp = out = 0
+        self._ledger.record_usage(
+            provider=self._provider,
+            model=self._model,
+            input_tokens=inp,
+            output_tokens=out,
+            latency_ms=latency,
+            status=status,
+            source="usage_block",
+            **self._kwargs,
+        )
+
+    def __enter__(self) -> _UsageContext:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Literal[False]:
+        self._record("error" if exc_type else "success")
+        return False
+
+    async def __aenter__(self) -> _UsageContext:
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> Literal[False]:
+        self._record("error" if exc_type else "success")
+        return False
 
 
 class TokenLedger:
@@ -338,6 +400,60 @@ class TokenLedger:
     def get_records(self, apply_dp: bool = False) -> list[dict[str, Any]]:
         records = self.store.get_records()
         return self._dp_records(records) if apply_dp else records
+
+    def usage(
+        self,
+        provider: str,
+        model: str,
+        messages: list[dict[str, Any]] | None = None,
+        output_text: str | None = None,
+        **kwargs: Any,
+    ) -> _UsageContext:
+        """Track an app code block as a usage record (``with`` or ``async with``).
+
+        Records on exit with tokens estimated from ``messages`` (and
+        ``output_text`` when given); marks ``status="error"`` if the block
+        raised. Extra kwargs pass through to :meth:`record_usage`.
+        """
+        return _UsageContext(self, provider, model, messages, output_text, **kwargs)
+
+    def cost_preview(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+        provider: str,
+        output_text: str | None = None,
+    ) -> dict[str, Any]:
+        """Estimate tokens and cost for a request without storing anything."""
+        est = self.estimator.estimate(messages=messages, model=model, provider=provider, output_text=output_text)
+        cost = self.pricing.calculate_cost(provider, model, est["input_tokens"], est["output_tokens"])
+        return {**est, "cost_usd": round(cost, 10)}
+
+    def create_wallet(
+        self,
+        user_id: str,
+        limit_usd: float,
+        reset_cycle: str = "daily",
+        low_balance_threshold: float = 0.2,
+        on_low_balance: Callable[[Wallet], None] | None = None,
+    ) -> Wallet:
+        """Create a per-user prepaid allowance wallet."""
+        from .wallet import Wallet
+
+        return Wallet(
+            self,
+            user_id=user_id,
+            limit_usd=limit_usd,
+            reset_cycle=reset_cycle,
+            low_balance_threshold=low_balance_threshold,
+            on_low_balance=on_low_balance,
+        )
+
+    def serve(self, host: str = "127.0.0.1", port: int = 8765) -> LiveServer:
+        """Start a live spend server (``/stats`` JSON + ``/stream`` SSE)."""
+        from ..ext.live_server import LiveServer
+
+        return LiveServer(self, host=host, port=port)
 
     def set_budget(self, scope: str, scope_id: str, limit_usd: float, reset_cycle: str = "monthly") -> None:
         self.store.set_budget(scope, scope_id, {"scope": scope, "scope_id": scope_id, "limit_usd": limit_usd, "reset_cycle": reset_cycle})
